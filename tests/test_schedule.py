@@ -1,0 +1,85 @@
+"""Schedules as data — the cron parser the daemon and board share."""
+
+import datetime
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from workforce.schedule import (  # noqa: E402
+    Cron, ScheduleError, calendar_intervals_to_cron, maybe_cron,
+)
+
+UTC = datetime.timezone.utc
+
+
+def dt(*args):
+    return datetime.datetime(*args, tzinfo=UTC)
+
+
+def test_half_hour_lane_cadence():
+    c = Cron("0,30 * * * *")  # the classic :00/:30 lane
+    assert c.matches(dt(2026, 7, 14, 9, 0))
+    assert c.matches(dt(2026, 7, 14, 9, 30))
+    assert not c.matches(dt(2026, 7, 14, 9, 15))
+    assert c.next_fire(dt(2026, 7, 14, 9, 1)) == dt(2026, 7, 14, 9, 30)
+    assert c.next_fire(dt(2026, 7, 14, 9, 30)) == dt(2026, 7, 14, 10, 0)  # strictly after
+
+
+def test_step_and_range():
+    c = Cron("*/15 8-17 * * *")
+    assert c.matches(dt(2026, 7, 14, 8, 45))
+    assert not c.matches(dt(2026, 7, 14, 7, 45))
+    assert c.next_fire(dt(2026, 7, 14, 17, 46)) == dt(2026, 7, 15, 8, 0)
+
+
+def test_weekly_report_job():
+    c = Cron("0 7 * * 1")  # Mondays 07:00
+    assert c.next_fire(dt(2026, 7, 14, 0, 0)) == dt(2026, 7, 20, 7, 0)  # Tue -> next Mon
+
+
+def test_dow_seven_is_sunday():
+    assert Cron("0 0 * * 7").matches(dt(2026, 7, 19, 0, 0))  # a Sunday
+
+
+def test_dom_dow_or_rule():
+    c = Cron("0 0 1 * 1")  # vixie: 1st of month OR any Monday
+    assert c.matches(dt(2026, 8, 1, 0, 0))    # a Saturday, but the 1st
+    assert c.matches(dt(2026, 7, 20, 0, 0))   # a Monday, not the 1st
+
+
+def test_malformed_rejected():
+    for bad in ("61 * * * *", "* * * * * *", "a * * * *", "*/0 * * * *", "5-1 * * * *"):
+        with pytest.raises(ScheduleError):
+            Cron(bad)
+
+
+def test_maybe_cron_ownership_boundary():
+    assert maybe_cron("0,30 * * * *") is not None
+    # informational strings are never daemon-owned — the migration gate
+    assert maybe_cron("launchd :00/:30 (legacy)") is None
+    assert maybe_cron("manual (daemon: slice 3)") is None
+    assert maybe_cron("") is None
+    assert maybe_cron("61 0 * * 1") is None  # 5 fields but invalid -> not owned
+
+
+def test_calendar_interval_single():
+    c = calendar_intervals_to_cron({"Minute": 15})
+    assert c is not None and c.expr == "15 * * * *"
+
+
+def test_calendar_interval_union():
+    c = calendar_intervals_to_cron([{"Minute": 0}, {"Minute": 30}])
+    assert c is not None and c.expr == "0,30 * * * *"
+
+
+def test_calendar_interval_weekly():
+    c = calendar_intervals_to_cron({"Minute": 0, "Hour": 7, "Weekday": 1})
+    assert c is not None and c.expr == "0 7 * * 1"
+
+
+def test_calendar_interval_irregular_union_not_guessed():
+    assert calendar_intervals_to_cron([{"Minute": 0}, {"Hour": 5}]) is None
+    assert calendar_intervals_to_cron([{"Minute": 0, "Hour": 1}, {"Minute": 30, "Hour": 2}]) is None

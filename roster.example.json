@@ -1,0 +1,35 @@
+{
+  "# Copy into local/roster.json (or point $WORKFORCE_ROSTER at it) to arm \u2014 dry-run first": [],
+  "workers": {
+    "claude-example": {
+      "kind": "lane",
+      "workdir": "/path/to/neighborhood",
+      "contract": "/path/to/neighborhood/workers/claude-example/CONTRACT.md",
+      "prompt": "/path/to/neighborhood/workers/claude-example/prompt.md",
+      "identity": "claude-example",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "{prompt_text}",
+        "--dangerously-skip-permissions",
+        "--no-session-persistence",
+        "--output-format",
+        "json"
+      ],
+      "usage_fields": {
+        "tok_in": "usage.input_tokens",
+        "tok_out": "usage.output_tokens",
+        "cost_usd": "total_cost_usd"
+      },
+      "model": "",
+      "budget_secs": 1500,
+      "schedule": "*/30 * * * *",
+      "queue_url": "http://127.0.0.1:8799/api/admin/tasks/ready?product=example",
+      "queue_count_key": "count",
+      "keychain_service": "claude-cli-oauth",
+      "keychain_env": "CLAUDE_CODE_OAUTH_TOKEN"
+    }
+  }
+}
