@@ -23,7 +23,7 @@ import re
 import subprocess
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 
 from .daemon import heartbeat_status, read_heartbeat
@@ -39,6 +39,62 @@ DEFAULT_PORT = int(os.environ.get("WORKFORCE_PORT") or "8797")
 # pc-23: "lane" is retired vocabulary on rendered surfaces; roster data still
 # says kind=lane until the schema migration lands.
 _KIND_LABELS = {"lane": "worker"}
+
+
+def generation_token(local_root: str) -> Dict[str, object]:
+    """Cheap freshness token for suite pulse bus.
+
+    Covers roster, daemon heartbeat (in_flight), ledger and run-file mtimes.
+    Tokens only — no worker bodies.
+    """
+    parts: List[str] = []
+    for name in ("roster.json", "daemon.json", "platforms.json"):
+        p = os.path.join(local_root, name)
+        try:
+            st = os.stat(p)
+            parts.append("%s:%d:%d" % (name, int(st.st_mtime), int(st.st_size)))
+        except OSError:
+            parts.append("%s:0" % name)
+    for sub in ("ledger", "run", "locks"):
+        d = os.path.join(local_root, sub)
+        max_m = 0
+        count = 0
+        try:
+            for fn in os.listdir(d):
+                try:
+                    m = int(os.path.getmtime(os.path.join(d, fn)))
+                    if m > max_m:
+                        max_m = m
+                    count += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        parts.append("%s:%d:%d" % (sub, max_m, count))
+    daemon_state = heartbeat_status(local_root) or "stopped"
+    hb = read_heartbeat(local_root) or {}
+    inflight = hb.get("in_flight") or []
+    if not isinstance(inflight, list):
+        inflight = []
+    parts.append("if:" + ",".join(sorted(str(x) for x in inflight)))
+    parts.append("daemon:" + str(daemon_state))
+    raw = "|".join(parts)
+    token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+    return {
+        "token": token,
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "in_flight": list(inflight),
+        "daemon": daemon_state,
+    }
+
+
+def _out_path(local_root: str, name: str) -> str:
+    return os.path.join(local_root, "run", "%s.out" % name)
+
+
+def _safe_worker_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name or ""))
 
 
 def _kind_label(kind: str) -> str:
@@ -3783,6 +3839,100 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        elif self.path == "/api/generation" or self.path == "/api/pulse":
+            # LIVE-B2: tokens only for suite pulse bus
+            data = json.dumps({"ok": True, **generation_token(self.local_root)}).encode(
+                "utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        elif (self.path.startswith("/api/out/")
+              and ("/stream" in self.path.split("?")[0])):
+            # LIVE-C: SSE tail of shift .out while worker in_flight
+            path_only = self.path.split("?")[0]
+            # /api/out/<name>/stream
+            parts = path_only.strip("/").split("/")
+            name = urllib.parse.unquote(parts[2]) if len(parts) >= 4 else ""
+            if not _safe_worker_name(name):
+                self._json_response({"ok": False, "msg": "bad worker name"}, 400)
+                return
+            hb0 = read_heartbeat(self.local_root) or {}
+            inflight = hb0.get("in_flight") or []
+            if not isinstance(inflight, list):
+                inflight = []
+            on_shift = name in inflight
+            out_path = _out_path(self.local_root, name)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            def _sse(event: str, payload: Dict[str, object]) -> None:
+                chunk = "event: %s\ndata: %s\n\n" % (
+                    event, json.dumps(payload, ensure_ascii=False))
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+
+            if not on_shift:
+                _sse("idle", {
+                    "ok": True, "worker": name, "in_flight": False,
+                    "msg": "not on shift",
+                })
+                return
+            if not os.path.isfile(out_path):
+                _sse("waiting", {
+                    "ok": True, "worker": name, "path": out_path,
+                    "msg": "out file not yet created",
+                })
+            # Tail growing file; re-check in_flight each loop
+            import time as _time
+            pos = 0
+            if os.path.isfile(out_path):
+                try:
+                    # Start near end (last 8 KiB) so reconnect isn't a full replay
+                    size = os.path.getsize(out_path)
+                    pos = max(0, size - 8192)
+                except OSError:
+                    pos = 0
+            idle_ticks = 0
+            try:
+                while idle_ticks < 600:  # ~10 min max stream
+                    hb = read_heartbeat(self.local_root) or {}
+                    infl = hb.get("in_flight") or []
+                    if name not in (infl if isinstance(infl, list) else []):
+                        _sse("end", {
+                            "ok": True, "worker": name, "reason": "shift ended",
+                        })
+                        break
+                    try:
+                        with open(out_path, "r", encoding="utf-8",
+                                  errors="replace") as fh:
+                            fh.seek(pos)
+                            chunk = fh.read()
+                            pos = fh.tell()
+                    except OSError:
+                        chunk = ""
+                    if chunk:
+                        _sse("chunk", {
+                            "ok": True, "worker": name, "text": chunk,
+                        })
+                        idle_ticks = 0
+                    else:
+                        idle_ticks += 1
+                        _sse("ping", {"ok": True, "worker": name})
+                    _time.sleep(1.0)
+                else:
+                    _sse("end", {
+                        "ok": True, "worker": name, "reason": "stream timeout",
+                    })
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         elif self.path == "/api/scene-tape":
             # oc-19: the traffic tape's own endpoint — the scene polls it on a
             # separate cadence so scene_model stays network-free. Degrades on
@@ -3888,12 +4038,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(port: Optional[int] = None, local_root: str = "local",
-                daemon: Optional[object] = None) -> HTTPServer:
+                daemon: Optional[object] = None) -> ThreadingHTTPServer:
     if port is None:
         port = DEFAULT_PORT  # resolved at call time so tests/config can repoint
     _Handler.local_root = local_root
     _Handler.daemon = daemon  # None = read-only board (standalone)
-    return HTTPServer(("127.0.0.1", port), _Handler)
+    # ThreadingHTTPServer so LIVE-C SSE tails do not block /api/scene.
+    return ThreadingHTTPServer(("127.0.0.1", port), _Handler)
 
 
 def serve(port: Optional[int] = None, local_root: str = "local") -> None:

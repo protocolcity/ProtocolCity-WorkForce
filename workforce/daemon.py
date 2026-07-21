@@ -25,17 +25,28 @@ Mechanics:
 import datetime
 import json
 import os
+import re
 import signal
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, List, Optional, Set, Tuple
 
 from . import engine, roster as roster_mod
 from .schedule import maybe_cron
 
 HEARTBEAT = "daemon.json"
+EVENT_CURSOR = "event_cursors.json"
 STALE_TICK_SECS = 180  # heartbeat older than this = daemon presumed dead
+# Desk base for event-trigger. Same default as board.
+DESK_URL = os.environ.get(
+    "WORKFORCE_DESK", os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799")
+)
+# Debounce: do not re-fire the same worker more often than this (seconds).
+EVENT_FIRE_COOLDOWN_SECS = 90
 
 
 def _utcnow() -> datetime.datetime:
@@ -89,6 +100,9 @@ class Daemon:
         self._threads: Dict[str, threading.Thread] = {}
         self._draining = False
         self._wake = threading.Event()  # set by begin_drain to cut the sleep short
+        # wf-74 event-trigger: poll cursor per WorkLane project + last fire time
+        self._event_cursors: Dict[str, int] = self._load_event_cursors()
+        self._event_last_fire: Dict[str, float] = {}  # worker -> monotonic ts
 
     def _reload_fired(self) -> Dict[str, str]:
         """Last-fired minute keys from the prior heartbeat, or {} on a fresh
@@ -203,6 +217,170 @@ class Daemon:
         self._log("manual dispatch %s" % name)
         return True, "dispatched"
 
+    # ── wf-74 event trigger (Desk feed → fire_now) ────────────────────
+
+    def _load_event_cursors(self) -> Dict[str, int]:
+        path = os.path.join(self.local_root, EVENT_CURSOR)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _save_event_cursors(self) -> None:
+        path = os.path.join(self.local_root, EVENT_CURSOR)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._event_cursors, fh, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as exc:
+            self._log("WARN event cursor save failed: %s" % exc)
+
+    def _projects_from_roster(self, roster: roster_mod.Roster) -> Set[str]:
+        """Infer WorkLane project slugs from worker queue_url query params."""
+        out: Set[str] = set()
+        for w in roster.workers.values():
+            url = (w.queue_url or "").strip()
+            if not url:
+                continue
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            except Exception:
+                continue
+            for key in ("project", "product"):
+                for val in qs.get(key) or []:
+                    if val and val.lower() not in ("", "all"):
+                        out.add(val.lower())
+        return out
+
+    def _workers_for_event(
+        self, roster: roster_mod.Roster, event: dict, project: str
+    ) -> List[str]:
+        """Map a ticket event to roster worker names (labels + queue_url)."""
+        labels = event.get("labels") or []
+        if not isinstance(labels, list):
+            labels = []
+        label_set = {str(x).lower() for x in labels}
+        names: List[str] = []
+        for name, w in roster.workers.items():
+            # Explicit assignment label worker:<name>
+            if ("worker:%s" % name.lower()) in label_set:
+                names.append(name)
+                continue
+            # Queue URL scoped to this project and worker/label
+            url = (w.queue_url or "").lower()
+            if not url:
+                continue
+            if project and ("project=%s" % project) not in url and (
+                "product=%s" % project
+            ) not in url:
+                continue
+            if ("worker=%s" % name.lower()) in url or (
+                "label=worker:%s" % name.lower()
+            ) in url:
+                names.append(name)
+        return names
+
+    def _poll_desk_events(self, project: str, since: int) -> Tuple[List[dict], int]:
+        """Fetch /api/events?project=&since= — returns (events, new_cursor)."""
+        q = urllib.parse.urlencode({
+            "project": project,
+            "since": str(max(0, int(since))),
+            "limit": "100",
+        })
+        url = "%s/api/events?%s" % (DESK_URL.rstrip("/"), q)
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                data = json.loads(r.read().decode("utf-8") or "{}")
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            return [], since
+        events = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(events, list):
+            events = []
+        cursor = data.get("cursor", since) if isinstance(data, dict) else since
+        try:
+            cursor = int(cursor)
+        except (TypeError, ValueError):
+            cursor = since
+        return events, cursor
+
+    def event_tick(self) -> int:
+        """Poll WorkLane ticket events and fire matching workers.
+
+        First run primes cursors to the latest event id (no historical replay).
+        Clock schedules remain the heartbeat; this is the event trigger source.
+        Returns number of workers dispatched.
+        """
+        if self._draining:
+            return 0
+        roster = self._roster()
+        if not roster:
+            return 0
+        projects = self._projects_from_roster(roster)
+        if not projects:
+            return 0
+        dispatched = 0
+        now_m = time.monotonic()
+        for project in sorted(projects):
+            since = int(self._event_cursors.get(project, -1))
+            if since < 0:
+                # Prime: jump to current end without replay
+                _, cursor = self._poll_desk_events(project, 10 ** 12)
+                # empty feed: cursor stays high; re-poll with since=0 get none
+                # Better: poll with since=0 limit=1 from high end — use cursor from
+                # empty since=max. Actually API returns cursor=since when empty.
+                # Fetch latest by since=0 limit=1 sorted asc then take last id...
+                # list_events is ASC from since. So since=0 limit=1 is oldest.
+                # Use large since to get empty and then we need max id differently.
+                # Practical prime: GET events?since=0&limit=1 is oldest; instead
+                # poll once with since=0 limit=500 and take max id, discard events.
+                bootstrap, _ = self._poll_desk_events(project, 0)
+                # fetch a second page? for prime only take last page by looping
+                max_id = 0
+                cur = 0
+                for _ in range(20):
+                    batch, cur = self._poll_desk_events(project, cur)
+                    if not batch:
+                        break
+                    max_id = max(max_id, int(batch[-1].get("id") or 0))
+                    if len(batch) < 100:
+                        break
+                    cur = int(batch[-1].get("id") or cur)
+                self._event_cursors[project] = max_id
+                self._log("event cursor primed %s=%d (no historical replay)"
+                          % (project, max_id))
+                continue
+            events, cursor = self._poll_desk_events(project, since)
+            if cursor > since:
+                self._event_cursors[project] = cursor
+            targets: Set[str] = set()
+            for ev in events:
+                et = (ev.get("event_type") or "").strip()
+                # status/label changes that imply work for someone
+                if et not in ("status_change", "labels_changed", "created",
+                              "comment"):
+                    continue
+                for name in self._workers_for_event(roster, ev, project):
+                    targets.add(name)
+            for name in sorted(targets):
+                last = self._event_last_fire.get(name, 0.0)
+                if now_m - last < EVENT_FIRE_COOLDOWN_SECS:
+                    continue
+                ok, msg = self.fire_now(name)
+                if ok:
+                    self._event_last_fire[name] = now_m
+                    dispatched += 1
+                    self._log("event dispatch %s (%s)" % (name, project))
+                else:
+                    self._log("event skip %s: %s" % (name, msg))
+        self._save_event_cursors()
+        return dispatched
+
     def start_board(self) -> Optional[threading.Thread]:
         """Serve the board from the daemon process — the ONE service carries
         its own UI across reboots. Port held elsewhere (e.g. a standalone
@@ -231,6 +409,11 @@ class Daemon:
             self.start_board()
         while True:
             self.tick()
+            # wf-74: event source between clock ticks (and on the tick)
+            try:
+                self.event_tick()
+            except Exception as exc:
+                self._log("WARN event_tick: %s" % exc)
             if self._draining:
                 waiting = self.in_flight()
                 if waiting:
@@ -241,8 +424,10 @@ class Daemon:
                 self._log("drained cleanly — exiting")
                 return 0
             now = time.time()
-            # minute-boundary sleep, interruptible by begin_drain
-            self._wake.wait(timeout=max(1.0, 60.0 - (now % 60.0)))
+            # Event poll cadence ~15s; clock still fires on minute boundary
+            # via tick() when the wait ends near :00.
+            wait = min(15.0, max(1.0, 60.0 - (now % 60.0)))
+            self._wake.wait(timeout=wait)
 
 
 def default_service_path() -> str:
