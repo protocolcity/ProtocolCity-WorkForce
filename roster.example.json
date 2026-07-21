@@ -29,7 +29,9 @@
       "queue_url": "http://127.0.0.1:8799/api/admin/tasks/ready?product=example",
       "queue_count_key": "count",
       "keychain_service": "claude-cli-oauth",
-      "keychain_env": "CLAUDE_CODE_OAUTH_TOKEN"
+      "keychain_env": "CLAUDE_CODE_OAUTH_TOKEN",
+      "authority_chain": [],
+      "authority_chain_required": false
     }
   }
 }

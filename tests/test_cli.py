@@ -66,3 +66,16 @@ def test_daemon_plist_stdout_is_clean_xml_url_hint_on_stderr(capsys):
     assert "http://127.0.0.1" not in captured.out
     # The door is mentioned, on stderr.
     assert "http://127.0.0.1:%d" % board.DEFAULT_PORT in captured.err
+
+
+def test_daemon_plist_bakes_data_dir_when_env_set(tmp_path, monkeypatch, capsys):
+    """WORKFORCE_DATA_DIR is carried into the plist so the daemon is self-contained."""
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(tmp_path))
+    rc = cli.main(["daemon-plist"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out.startswith("<?xml")
+    # data_dir appears as both WorkingDirectory and an EnvironmentVariables entry.
+    assert str(tmp_path) in captured.out
+    assert "WORKFORCE_DATA_DIR" in captured.out

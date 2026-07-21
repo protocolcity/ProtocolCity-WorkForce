@@ -58,9 +58,11 @@ def test_scene_model_groups_workers_into_workplace_sectors(tmp_path, monkeypatch
     assert [w["name"] for w in by_place["hoodB"]["workers"]] == ["beta"]
     # every worker carries the raw facts the scene JS renders
     a = by_place["hoodA"]["workers"][0]
-    for key in ("name", "kind", "display", "model", "schedule", "owned",
-                "next_fire", "queue", "health", "last_shift"):
+    for key in ("name", "kind", "display", "cli", "model", "schedule", "owned",
+                "next_fire", "queue", "health", "last_shift", "holding"):
         assert key in a
+    assert a["cli"] == "true"  # command=["true"] fixture
+    assert a["holding"] == []  # not in_flight
 
 
 def test_scene_model_exposes_display_when_set(tmp_path, monkeypatch):
@@ -91,6 +93,59 @@ def test_bay_js_prefers_display_over_name():
     """SCENE_JS bay() label: display when set, else name."""
     assert "w.display" in board.SCENE_JS
     assert "succeeds " in board.SCENE_JS
+
+
+def test_bay_js_exposes_payroll_and_live_claim_and_paused():
+    """Floor-watch slice: model/CLI subtitle, claim teaser, PAUSED chip."""
+    js = board.SCENE_JS
+    assert "function payrollLine" in js
+    assert "bay-pay" in js
+    assert "claimHref" in js
+    assert "function isPaused" in js
+    assert '"PAUSED"' in js or "return \"PAUSED\"" in js
+
+
+def test_scene_model_cli_from_command_path(tmp_path, monkeypatch):
+    local = _local(tmp_path)
+    w = _worker(tmp_path, "kai", "hoodK")
+    w.command = ["/tmp/fixture/.grok/bin/grok", "--model", "{model}"]
+    w.model = "grok-4.5"
+    roster = Roster(workers={"kai": w}, path="t")
+    _patch_roster(monkeypatch, roster)
+    workers = {row["name"]: row
+               for s in board.scene_model(str(local))["sectors"]
+               for row in s["workers"]}
+    assert workers["kai"]["cli"] == "grok"
+    assert workers["kai"]["model"] == "grok-4.5"
+
+
+def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
+    local = _local(tmp_path)
+    active = _worker(tmp_path, "morgan", "hoodM")
+    idle = _worker(tmp_path, "riley", "hoodR")
+    roster = Roster(workers={"morgan": active, "riley": idle}, path="t")
+    _patch_roster(monkeypatch, roster)
+    monkeypatch.setattr(board, "heartbeat_status", lambda _root: "running")
+    monkeypatch.setattr(
+        board, "read_heartbeat",
+        lambda _root: {"pid": 1, "last_tick": "2026-07-16T12:00:00Z",
+                       "state": "scheduling", "in_flight": ["morgan"]})
+    calls = []
+
+    def fake_holdings(w):
+        calls.append(w.name)
+        return [{"id": "ts-1", "title": "Land the bay claim line",
+                 "status": "in_progress", "href": "http://desk/t/ts-1"}]
+
+    monkeypatch.setattr(board, "_worker_holdings", fake_holdings)
+    model = board.scene_model(str(local))
+    workers = {row["name"]: row
+               for s in model["sectors"]
+               for row in s["workers"]}
+    assert model["in_flight"] == ["morgan"]
+    assert calls == ["morgan"]
+    assert workers["morgan"]["holding"][0]["id"] == "ts-1"
+    assert workers["riley"]["holding"] == []
 
 
 def test_scene_model_owned_and_next_fire_from_cron(tmp_path, monkeypatch):

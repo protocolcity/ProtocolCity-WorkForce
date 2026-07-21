@@ -184,3 +184,178 @@ def test_roster_rejects_unknown_fields_and_bad_kind(tmp_path):
         "command": ["x"], "sudo": True}}}))
     with pytest.raises(RosterError, match="unknown fields"):
         load(str(p))
+
+
+def test_vendor_limit_exit_classifies_reason(tmp_path):
+    """rc != 0 with 402 in output → reason 'vendor limit: …', not bare 'agent exit'."""
+    w = make_worker(tmp_path, command=[
+        "/bin/sh", "-c",
+        "echo '402 Payment Required: usage balance exhausted'; exit 1",
+    ])
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "vendor limit:" in text
+    assert "agent exit" not in text
+
+
+def test_vendor_limit_exit_with_429(tmp_path):
+    """429 rate-limit exit → vendor_limit classification."""
+    w = make_worker(tmp_path, command=[
+        "/bin/sh", "-c",
+        "echo 'error: 429 too many requests — rate limit exceeded'; exit 1",
+    ])
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "vendor limit:" in ledger_text(tmp_path)
+
+
+def test_plain_nonzero_exit_stays_agent_exit(tmp_path):
+    """A generic non-zero exit with no vendor-limit output stays 'agent exit'."""
+    w = make_worker(tmp_path, command=["/bin/sh", "-c", "echo 'unrelated error'; exit 2"])
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "agent exit" in ledger_text(tmp_path)
+
+
+def test_classify_exit_never_raises_on_missing_file(tmp_path):
+    """_classify_exit must not raise when output file is absent."""
+    result = engine._classify_exit(str(tmp_path / "nonexistent.out"))
+    assert result == "agent exit"
+
+
+# §6 authority-chain tests
+
+def test_authority_chain_empty_no_required_is_noop(tmp_path):
+    """Empty chain + required=False → normal dispatch; chain_len=0 in START."""
+    w = make_worker(tmp_path)
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "START" in text and "chain_len=0" in text
+    assert "NO_AUTHORITY_CHAIN" not in text
+
+
+def test_authority_chain_required_empty_chain_errors(tmp_path):
+    """authority_chain_required=True + empty chain → ERROR NO_AUTHORITY_CHAIN before START."""
+    w = make_worker(tmp_path, authority_chain_required=True)
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "NO_AUTHORITY_CHAIN" in text
+    assert "START" not in text
+
+
+def test_authority_chain_populated_pins_in_start(tmp_path):
+    """Populated chain → chain_len and chain_sha appear in START; files read at dispatch."""
+    law = tmp_path / "city-law.md"
+    law.write_text("# L0 city law\n")
+    w = make_worker(tmp_path, authority_chain=[str(law)])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "chain_len=1" in text
+    assert "chain_sha=" in text
+
+
+def test_authority_chain_multiple_files_all_pinned(tmp_path):
+    """Multiple chain files → combined sha, chain_len=N."""
+    l0 = tmp_path / "l0.md"
+    l1 = tmp_path / "l1.md"
+    l0.write_text("# L0\n")
+    l1.write_text("# L1\n")
+    w = make_worker(tmp_path, authority_chain=[str(l0), str(l1)])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "chain_len=2" in text
+    assert "chain_sha=" in text
+
+
+def test_authority_chain_missing_file_errors(tmp_path):
+    """Chain entry pointing to a missing file → ERROR before START."""
+    w = make_worker(tmp_path, authority_chain=[str(tmp_path / "ghost.md")])
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "authority chain file unreadable" in text
+    assert "START" not in text
+
+
+def test_authority_chain_paths_exposed_in_env(tmp_path):
+    """WORKFORCE_AUTHORITY_CHAIN_PATHS set in child env when chain is non-empty."""
+    law = tmp_path / "law.md"
+    law.write_text("# law\n")
+    out = tmp_path / "env.txt"
+    w = make_worker(tmp_path, authority_chain=[str(law)],
+                    command=["/bin/sh", "-c", "env > %s" % out])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    env_text = out.read_text()
+    assert "WORKFORCE_AUTHORITY_CHAIN_PATHS=" in env_text
+    assert str(law) in env_text
+
+
+def test_authority_chain_text_substituted_in_argv(tmp_path):
+    """'{chain_text}' in command template is replaced with concatenated chain content."""
+    law = tmp_path / "law.md"
+    law.write_text("CHAIN_SENTINEL\n")
+    out = tmp_path / "argv.txt"
+    w = make_worker(tmp_path, authority_chain=[str(law)],
+                    command=["/bin/sh", "-c", "echo '{chain_text}' > %s" % out,
+                             "{chain_text}"])
+    # build_argv directly
+    entries = engine._load_chain([str(law)])
+    chain_text = "\n\n".join(t for t, _ in entries)
+    argv = engine._build_argv(w, "brief", chain_text=chain_text)
+    assert any("CHAIN_SENTINEL" in tok for tok in argv)
+
+
+def test_authority_chain_dry_run_loads_and_pins(tmp_path):
+    """Dry-run still reads chain files and pins chain_sha in START."""
+    law = tmp_path / "law.md"
+    law.write_text("# law\n")
+    w = make_worker(tmp_path, authority_chain=[str(law)])
+    assert engine.dispatch(w, local(tmp_path), dry_run=True) == 0
+    text = ledger_text(tmp_path)
+    assert "chain_len=1" in text and "chain_sha=" in text and "dry_run=1" in text
+
+
+def test_authority_chain_no_paths_in_env_when_empty(tmp_path):
+    """When chain is empty, WORKFORCE_AUTHORITY_CHAIN_PATHS is NOT set in child env."""
+    out = tmp_path / "env.txt"
+    w = make_worker(tmp_path, command=["/bin/sh", "-c", "env > %s" % out])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "WORKFORCE_AUTHORITY_CHAIN_PATHS" not in out.read_text()
+
+
+# §8 ghost audit
+
+def test_ghost_audit_fires_and_logs_ghost_event(tmp_path):
+    """Populated ghost_audit runs before START; GHOST event with rc=0 is logged."""
+    marker = tmp_path / "ghost_ran"
+    w = make_worker(tmp_path, ghost_audit=["/bin/sh", "-c", "echo 'no orphans'; touch %s" % marker])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert marker.exists(), "ghost audit command did not run"
+    text = ledger_text(tmp_path)
+    assert "GHOST" in text and "rc=0" in text
+    ghost_line = next(l for l in text.splitlines() if " GHOST " in l)
+    start_line = next(l for l in text.splitlines() if " START " in l)
+    assert ghost_line < start_line, "GHOST must precede START in the ledger"
+
+
+def test_ghost_audit_empty_is_noop(tmp_path):
+    """Empty ghost_audit (default) produces no GHOST event."""
+    w = make_worker(tmp_path)
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "GHOST" not in ledger_text(tmp_path)
+
+
+def test_ghost_audit_nonzero_rc_warns_not_aborts(tmp_path):
+    """Nonzero ghost_audit rc → GHOST + WARN in ledger; shift still completes."""
+    w = make_worker(tmp_path, ghost_audit=["/bin/sh", "-c", "echo 'orphan: t-1245'; exit 1"])
+    assert engine.dispatch(w, local(tmp_path)) == 0  # shift ran, not aborted
+    text = ledger_text(tmp_path)
+    assert "GHOST" in text and "rc=1" in text
+    assert "WARN" in text and "ghost-audit" in text
+    assert "START" in text and "DONE" in text
+
+
+def test_ghost_audit_skipped_in_dry_run(tmp_path):
+    """Dry-run must not spawn the ghost audit command."""
+    marker = tmp_path / "ghost_ran"
+    w = make_worker(tmp_path, ghost_audit=["/bin/sh", "-c", "touch %s" % marker])
+    assert engine.dispatch(w, local(tmp_path), dry_run=True) == 0
+    assert not marker.exists(), "ghost audit must not spawn in dry-run"
+    assert "GHOST" not in ledger_text(tmp_path)

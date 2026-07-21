@@ -5,9 +5,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from workforce.board import _contract_rules, _law_stack, _worker_queue  # noqa: E402
+from workforce.board import (  # noqa: E402
+    _contract_rules, _law_stack, _worker_flags, _worker_queue, render_law, worker_model,
+)
 from workforce.ledger import parse_shifts  # noqa: E402
-from workforce.roster import Worker  # noqa: E402
+from workforce.roster import Roster, Worker  # noqa: E402
 
 LEDGER = """\
 2026-07-14T01:40:00Z SKIP reason="CLI 'claude' not installed"
@@ -119,3 +121,206 @@ def test_contract_rules_picks_rule_headings(tmp_path):
     titles = [r["title"] for r in rules]
     assert "Lane" in titles and "Never touch" in titles
     assert "Notes" not in titles
+
+
+def test_render_law_level_badge(tmp_path):
+    """Law lens page for contract/prompt shows the L-level badge, not the opaque stackN index.
+    Back link is person-scoped (/worker/<name>), not the generic Roster root."""
+    import json
+
+    w = make_worker(tmp_path)
+    # Roster.json lives at <base>/local/roster.json; base = parent of local_root.
+    local = tmp_path / "city" / "local"
+    local.mkdir(exist_ok=True)
+    (local / "ledger").mkdir(exist_ok=True)
+    (local / "roster.json").write_text(json.dumps({"workers": {"x": {
+        "workdir": w.workdir, "contract": w.contract, "prompt": w.prompt,
+        "identity": "x", "command": ["true"],
+    }}}))
+
+    stack = _law_stack(w)
+    c_idx = next(i for i, e in enumerate(stack) if e["label"] == "contract")
+    p_idx = next(i for i, e in enumerate(stack) if e["label"] == "prompt")
+
+    # Contract paper (L2 in the standard 4-entry stack)
+    page = render_law(str(local), "x", "stack%d" % c_idx)
+    assert page is not None
+    c_badge = "%s · contract" % stack[c_idx]["level"]
+    assert c_badge in page          # "L2 · contract" appears in the rendered page
+    assert "CONTRACT.md" in page
+    assert "/worker/x" in page      # back link is person-scoped
+
+    # Prompt paper (L3)
+    page_p = render_law(str(local), "x", "stack%d" % p_idx)
+    assert page_p is not None
+    p_badge = "%s · prompt" % stack[p_idx]["level"]
+    assert p_badge in page_p        # "L3 · prompt" appears
+    assert "prompt.md" in page_p
+    assert "/worker/x" in page_p
+
+    # Named routes still resolve
+    page_named = render_law(str(local), "x", "contract")
+    assert page_named is not None
+    assert c_badge in page_named
+
+
+def test_vendor_limit_error_parses_as_distinct_outcome():
+    """ERROR with reason 'vendor limit: …' → outcome 'vendor_limit', not 'error'."""
+    text = (
+        "2026-07-14T03:00:00Z START identity=x kind=lane budget_secs=1500 queue=5 dry_run=0\n"
+        '2026-07-14T03:01:00Z ERROR reason="vendor limit: 402 Payment Required" rc=1 on_pass=1\n'
+    )
+    shifts = parse_shifts(text)
+    assert shifts[0]["outcome"] == "vendor_limit"
+    assert shifts[0]["reason"].startswith("vendor limit:")
+
+
+def test_generic_error_stays_error_outcome():
+    """ERROR with reason 'agent exit' stays 'error', not 'vendor_limit'."""
+    text = (
+        "2026-07-14T03:00:00Z START identity=x kind=lane budget_secs=1500 queue=5 dry_run=0\n"
+        "2026-07-14T03:01:00Z ERROR reason=\"agent exit\" rc=1 on_pass=1\n"
+    )
+    shifts = parse_shifts(text)
+    assert shifts[0]["outcome"] == "error"
+
+
+def test_vendor_limit_health_is_amber_not_err(tmp_path):
+    """A worker whose last shift was a vendor-limit exit gets amber health, not err."""
+    from workforce.board import _worker_health
+    from workforce.ledger import Ledger
+
+    w = make_worker(tmp_path)
+    ledger_dir = tmp_path / "local" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    led = Ledger(str(tmp_path / "local" / "ledger"), "x")
+    led.append("START", identity="x", kind="lane", budget_secs=1500, queue=5, dry_run=0)
+    led.append("ERROR", reason="vendor limit: 402 Payment Required", rc=1, on_pass=1)
+
+    health = _worker_health(str(tmp_path / "local"), w, "5")
+    assert health["cls"] == "amber"
+    assert "vendor limit" in health["why"]
+
+
+def test_outcome_cls_maps_vendor_limit_to_amber():
+    from workforce.board import OUTCOME_CLS
+    assert OUTCOME_CLS.get("vendor_limit") == "amber"
+    assert OUTCOME_CLS.get("error") == "err"
+
+
+# ── FLAGS tests ──────────────────────────────────────────────────────
+
+def _flag_worker(tmp_path, queue_url=""):
+    w = make_worker(tmp_path)
+    w.queue_url = queue_url
+    return w
+
+
+def test_worker_flags_empty_when_no_queue_url(tmp_path):
+    w = _flag_worker(tmp_path, queue_url="")
+    assert _worker_flags(w) == []
+
+
+def test_worker_flags_empty_when_label_missing_from_queue_url(tmp_path):
+    w = _flag_worker(tmp_path, queue_url="http://127.0.0.1:9999/api?product=workforce")
+    assert _worker_flags(w) == []
+
+
+def test_worker_flags_queries_backlog_and_parked(tmp_path, monkeypatch):
+    import workforce.board as board_mod
+
+    calls = []
+
+    def fake_desk(path):
+        calls.append(path)
+        if "status=backlog" in path:
+            return {"tasks": [{"id": "wf-60", "title": "flags row",
+                               "labels": ["worker:x"]}]}
+        if "status=parked" in path:
+            return {"tasks": [{"id": "wf-9", "title": "ghost audit",
+                               "labels": ["needs:founder-decision", "worker:x"]}]}
+        return None
+
+    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    w = _flag_worker(tmp_path,
+                     queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
+    flags = _worker_flags(w)
+
+    assert any("backlog" in c and "worker%3Ax" in c for c in calls), calls
+    assert any("parked" in c for c in calls), calls
+    ids = [f["id"] for f in flags]
+    assert "wf-60" in ids and "wf-9" in ids
+
+
+def test_worker_flags_marks_founder_gated(tmp_path, monkeypatch):
+    import workforce.board as board_mod
+
+    def fake_desk(path):
+        if "status=parked" in path:
+            return {"tasks": [{"id": "wf-9", "title": "ghost audit",
+                               "labels": ["needs:founder-decision"]}]}
+        return {"tasks": []}
+
+    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    w = _flag_worker(tmp_path,
+                     queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
+    flags = _worker_flags(w)
+    parked = next(f for f in flags if f["id"] == "wf-9")
+    assert parked["founder_gated"] is True
+
+
+def test_worker_flags_non_gated_ticket_not_marked(tmp_path, monkeypatch):
+    import workforce.board as board_mod
+
+    def fake_desk(path):
+        if "status=backlog" in path:
+            return {"tasks": [{"id": "wf-60", "title": "flags row",
+                               "labels": ["worker:x", "ops"]}]}
+        return {"tasks": []}
+
+    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    w = _flag_worker(tmp_path,
+                     queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
+    flags = _worker_flags(w)
+    assert len(flags) == 1
+    assert flags[0]["founder_gated"] is False
+
+
+def test_worker_model_includes_flags(tmp_path, monkeypatch):
+    import json
+    import workforce.board as board_mod
+    from workforce.roster import Roster
+
+    hood = tmp_path / "city" / "hood"
+    hood.mkdir(parents=True)
+    (tmp_path / "city" / "AGENTS.md").write_text("# city\n")
+    (hood / "AGENTS.md").write_text("# hood\n")
+    contract = hood / "CONTRACT.md"
+    contract.write_text("# contract\n")
+    prompt = hood / "prompt.md"
+    prompt.write_text("brief\n")
+
+    local = tmp_path / "city" / "local"
+    local.mkdir(exist_ok=True)
+    (local / "ledger").mkdir(exist_ok=True)
+    w = Worker(name="x", workdir=str(hood), contract=str(contract),
+               prompt=str(prompt), identity="x", command=["true"],
+               queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
+    (local / "roster.json").write_text(json.dumps({"workers": {"x": {
+        "workdir": str(hood), "contract": str(contract), "prompt": str(prompt),
+        "identity": "x", "command": ["true"],
+        "queue_url": "http://127.0.0.1:9999/api?product=workforce&label=worker:x",
+    }}}))
+
+    monkeypatch.setattr(board_mod, "_worker_holdings", lambda _w: [])
+    monkeypatch.setattr(board_mod, "_worker_ready_teaser", lambda _w, **_kw: [])
+    monkeypatch.setattr(board_mod, "_worker_flags",
+                        lambda _w: [{"id": "wf-60", "title": "flags row",
+                                     "status": "backlog", "founder_gated": False,
+                                     "labels": [], "priority": 3, "href": ""}])
+    monkeypatch.setattr(board_mod, "_worker_queue", lambda _w: "5")
+
+    model = board_mod.worker_model(str(local), "x")
+    assert model is not None
+    assert "flags" in model
+    assert model["flags"][0]["id"] == "wf-60"

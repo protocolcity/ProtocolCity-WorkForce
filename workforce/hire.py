@@ -21,11 +21,10 @@ from .roster import (
     load,
 )
 
-# Pre-installed Office staff + synthetic citizen — not cabinet hires.
-FORBIDDEN_HIRE_NAMES = frozenset({
-    "you", "office-steward", "daily-brief", "wren",
-    "holt", "ames",  # display aliases — block if used as slugs
-})
+# "you" is the synthetic citizen — never a roster entry, never hireable.
+# Permanent Office staff (office-steward, daily-brief, …) are blocked by
+# the roster duplicate-slug guard once their staff=True rows exist.
+FORBIDDEN_HIRE_NAMES = frozenset({"you"})
 
 DEFAULT_COMMAND = [
     "claude", "--model", "{model}", "-p", "{prompt_text}",
@@ -85,7 +84,7 @@ def slugify(name: str) -> str:
 def _resolve_roster_path(path: Optional[str], base: str) -> str:
     if path:
         return path
-    env = os.environ.get("WORKFORCE_ROSTER")
+    env = os.environ.get("WORKFORCE_ROSTER") or os.environ.get("WORKFORCE_ROSTER")
     if env:
         return env
     for candidate in DEFAULT_ROSTER_PATHS:
@@ -248,8 +247,7 @@ def hire(
         raise RosterError("hire needs a persona name (slug empty)")
     if slug in FORBIDDEN_HIRE_NAMES or name.strip().lower() in FORBIDDEN_HIRE_NAMES:
         raise RosterError(
-            "cannot hire %r — You and Office staff are permanent seats"
-            % name
+            "cannot hire %r — permanent synthetic citizen seat" % name
         )
     workdir = os.path.abspath(workdir)
     if not os.path.isdir(workdir):
@@ -257,7 +255,7 @@ def hire(
 
     identity = slugify(identity) if identity else slug
     if identity in FORBIDDEN_HIRE_NAMES:
-        raise RosterError("identity %r is reserved for Office staff" % identity)
+        raise RosterError("identity %r is reserved (synthetic citizen)" % identity)
 
     role_title = (role or "").strip()
     if display:

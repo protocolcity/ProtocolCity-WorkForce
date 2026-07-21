@@ -259,12 +259,23 @@ def default_service_path() -> str:
     return ":".join(p for p in candidates if os.path.isdir(p))
 
 
-def plist_xml(base: str, python: Optional[str] = None, path: Optional[str] = None) -> str:
-    """The single launchd agent — the one bootstrap artifact (macOS)."""
+def plist_xml(base: str, python: Optional[str] = None, path: Optional[str] = None,
+              data_dir: Optional[str] = None) -> str:
+    """The single launchd agent — the one bootstrap artifact (macOS).
+
+    If ``data_dir`` is provided (or ``WORKFORCE_DATA_DIR`` is set by the
+    caller), the plist bakes it into EnvironmentVariables and uses it as
+    WorkingDirectory so the daemon always finds its state without needing the
+    user to ``cd`` into the repo.
+    """
     from xml.sax.saxutils import escape
     python = python or sys.executable
     path = path or default_service_path()
-    log = os.path.join(base, "local", "daemon.log")
+    workdir = data_dir if data_dir else base
+    log = os.path.join(workdir, "daemon.log") if data_dir else os.path.join(base, "local", "daemon.log")
+    env_block = "        <key>PATH</key><string>%s</string>" % escape(path)
+    if data_dir:
+        env_block += "\n        <key>WORKFORCE_DATA_DIR</key><string>%s</string>" % escape(data_dir)
     return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -279,7 +290,7 @@ def plist_xml(base: str, python: Optional[str] = None, path: Optional[str] = Non
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key><string>%s</string>
+%s
     </dict>
     <key>WorkingDirectory</key><string>%s</string>
     <key>RunAtLoad</key><true/>
@@ -289,4 +300,4 @@ def plist_xml(base: str, python: Optional[str] = None, path: Optional[str] = Non
     <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-""" % (escape(python), escape(path), escape(base), escape(log), escape(log))
+""" % (escape(python), env_block, escape(workdir), escape(log), escape(log))

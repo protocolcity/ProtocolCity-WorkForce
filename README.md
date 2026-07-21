@@ -43,6 +43,35 @@ The board serves at `http://127.0.0.1:8797` by default.
   you run (`workforce daemon-plist` prints a launchd agent for macOS);
   hiring, pausing, or rescheduling a worker is a roster edit, not a deploy.
 
+## Configuration
+
+All configuration is optional — WorkForce works out of the box from the repo
+root with no env vars set. For installed-package deployments or
+multi-directory setups, use these variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `WORKFORCE_DATA_DIR` | `./local` (CWD) | Home directory for WorkForce runtime state (roster, ledger, daemon heartbeat). Set this when running `workforce` commands from outside the repo root so the daemon and board always find their data. |
+| `WORKFORCE_PORT` | `8797` | HTTP port for `workforce board` and `workforce daemon`. |
+| `WORKFORCE_ROSTER` | `$WORKFORCE_DATA_DIR/local/roster.json` | Explicit roster path — overrides the default search under `WORKFORCE_DATA_DIR`. |
+| `WORKFORCE_DESK` | `http://127.0.0.1:8799` | WorkLane / Desk API URL used by the board's activity join. |
+| `WORKFORCE_CITYHALL` | `http://127.0.0.1:8796` | City-hall API URL used by the board's city join. |
+| `WORKFORCE_BRAND` | `city` | Board brand mode: `city` (ProtocolCity suite) or `standalone`. |
+| `PROTOCOLCITY_TEMPLATES` | _(sibling checkout)_ | Path to ProtocolCity templates for `workforce hire --no-plant`. |
+
+**Installed-package quickstart:**
+
+```
+export WORKFORCE_DATA_DIR=~/.workforce
+mkdir -p "$WORKFORCE_DATA_DIR/local"
+# copy roster.example.json → $WORKFORCE_DATA_DIR/local/roster.json and edit
+workforce roster
+workforce daemon
+```
+
+**launchd (macOS):** run `workforce daemon-plist` while `WORKFORCE_DATA_DIR`
+is set and the plist will bake it into `EnvironmentVariables` automatically.
+
 ## Hiring a worker
 
 ```

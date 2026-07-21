@@ -73,8 +73,16 @@ def main(argv=None) -> int:
     p_plist.add_argument("--path", default=None,
                          help="service PATH (default: conventional user-CLI dirs that exist)")
 
+    sub.add_parser("runtimes",
+                   help="list installed agent runtimes and their employment status")
+
     args = parser.parse_args(argv)
-    local_root = os.path.join(os.getcwd(), "local")
+    _data_env = os.environ.get("WORKFORCE_DATA_DIR", "").strip()
+    # _base: the WorkForce home directory — source of local/ state and roster.
+    # When WORKFORCE_DATA_DIR is set (installed-package installs, multi-dir
+    # setups), use it directly so the daemon and board never depend on CWD.
+    _base = _data_env if _data_env else os.getcwd()
+    local_root = os.path.join(_base, "local")
 
     if args.cmd == "board":
         from . import board
@@ -99,7 +107,7 @@ def main(argv=None) -> int:
 
     if args.cmd == "daemon":
         from .daemon import Daemon
-        d = Daemon(base=os.getcwd(), local_root=local_root)
+        d = Daemon(base=_base, local_root=local_root)
         if args.once:
             fired = d.tick(wait=True)
             print("tick complete: fired %d worker(s)" % fired)
@@ -108,7 +116,7 @@ def main(argv=None) -> int:
 
     if args.cmd == "daemon-plist":
         from .daemon import plist_xml
-        print(plist_xml(os.getcwd(), path=args.path), end="")
+        print(plist_xml(_base, path=args.path, data_dir=_data_env or None), end="")
         # The door, on stderr so stdout stays clean XML for redirection into
         # the plist.
         print("# once bootstrapped, the board is at %s  (`workforce open`)"
@@ -133,7 +141,7 @@ def main(argv=None) -> int:
                 plant=not args.no_plant,
                 force_papers=args.force_papers,
                 roster_path=args.file,
-                base=os.getcwd(),
+                base=_base,
                 dry_run=args.dry_run,
             )
         except RosterError as exc:
@@ -144,8 +152,28 @@ def main(argv=None) -> int:
             print("  next: %s" % step)
         return 0
 
+    if args.cmd == "runtimes":
+        from .runtimes import detect, staffing_pool
+        detected = detect()
+        r = None
+        try:
+            r = roster_mod.load(args.file, base=_base)
+        except roster_mod.RosterError:
+            print("(no roster found — employment status unavailable)", file=sys.stderr)
+        pool = staffing_pool(detected, r)
+        n_installed = sum(1 for e in pool if e["path"] is not None)
+        print("RUNTIME STAFFING POOL (%d of %d installed)" % (n_installed, len(pool)))
+        for e in pool:
+            if e["path"] is None:
+                print("  %-10s (not installed)" % e["cli"])
+            else:
+                workers = e["workers"]
+                status = ("employed by: " + ", ".join(sorted(workers))) if workers else "available"
+                print("  %-10s %-40s [%s]" % (e["cli"], e["path"], status))
+        return 0
+
     try:
-        r = roster_mod.load(args.file)
+        r = roster_mod.load(args.file, base=_base)
     except roster_mod.RosterError as exc:
         print("roster error: %s" % exc, file=sys.stderr)
         return 1

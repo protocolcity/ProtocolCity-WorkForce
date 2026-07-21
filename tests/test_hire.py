@@ -17,16 +17,32 @@ def test_slugify():
     assert hire_mod.slugify("  Ames  ") == "ames"
 
 
-def test_hire_rejects_office_staff(tmp_path):
+def test_hire_rejects_slug_already_on_roster(tmp_path):
+    """Staff (or any) worker already on the roster can't be hired again."""
     hood = tmp_path / "hood"
     hood.mkdir()
-    with pytest.raises(RosterError, match="permanent"):
+    roster_path = tmp_path / "local" / "roster.json"
+    (tmp_path / "local").mkdir()
+    roster_path.write_text(json.dumps({
+        "workers": {
+            "office-steward": {
+                "staff": True,
+                "kind": "job",
+                "workdir": str(hood),
+                "contract": str(hood / "c.md"),
+                "prompt": str(hood / "p.md"),
+                "identity": "office-steward",
+                "command": ["true"],
+            }
+        }
+    }))
+    with pytest.raises(RosterError, match="already on the roster"):
         hire_mod.hire(
             name="office-steward",
             workdir=str(hood),
             role="Steward",
             base=str(tmp_path),
-            roster_path=str(tmp_path / "local" / "roster.json"),
+            roster_path=str(roster_path),
             dry_run=True,
         )
 

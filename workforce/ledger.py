@@ -11,7 +11,7 @@ import re
 from typing import List, Optional, Union
 
 
-EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN")
+EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST")
 
 
 def _utcnow() -> str:
@@ -96,8 +96,14 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
                 current["reason"] = "dry-run"
                 current = None
         elif kind in ("STOP", "ERROR") and current is not None:
-            current["outcome"] = "ok" if kind == "STOP" else "error"
-            current["reason"] = ev.get("reason", "")
+            reason = ev.get("reason", "")
+            if kind == "STOP":
+                current["outcome"] = "ok"
+            elif reason.startswith("vendor limit:"):
+                current["outcome"] = "vendor_limit"
+            else:
+                current["outcome"] = "error"
+            current["reason"] = reason
             current["end_ts"] = ev["ts"]
             current = None
         elif kind in ("SKIP", "ERROR", "WARN"):

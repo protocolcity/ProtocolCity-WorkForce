@@ -54,6 +54,10 @@ class Worker:
     owner: str = ""                    # accountable human or lane: owner-terminal | worker name
     skill: str = ""                    # optional capability id (matches .claude/skills/<id>)
     usage_fields: Dict[str, str] = field(default_factory=dict)  # ledger key -> dot-path into the pass's JSON output (consumption telemetry, oc-35); vendor specifics stay in config
+    authority_chain: List[str] = field(default_factory=list)  # §6 explicit ordered law-file paths (L0 city, L1 business, ...); empty = no chain declared
+    authority_chain_required: bool = False  # when True, dispatch fails closed (NO_AUTHORITY_CHAIN) if authority_chain is empty
+    staff: bool = False                    # permanent Office seat — boards group separately; hire gate blocks re-hire
+    ghost_audit: List[str] = field(default_factory=list)  # §8 pre-shift reconciler argv; empty = no audit
 
     def validate(self) -> None:
         if not self.name:
@@ -128,7 +132,10 @@ def _resolve_path(explicit: Optional[str], base: str) -> str:
 
 def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
     base = base or os.getcwd()
-    path = _resolve_path(path or os.environ.get("WORKFORCE_ROSTER"), base)
+    path = _resolve_path(
+        path or os.environ.get("WORKFORCE_ROSTER") or os.environ.get("WORKFORCE_ROSTER"),
+        base,
+    )
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh)

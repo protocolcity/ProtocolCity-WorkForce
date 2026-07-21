@@ -32,8 +32,9 @@ from .ledger import Ledger, parse_shifts
 from .roster import Roster, RosterError, Worker
 from .schedule import calendar_intervals_to_cron, maybe_cron
 from . import roster as roster_mod
+from . import runtimes as runtimes_mod
 
-DEFAULT_PORT = 8797
+DEFAULT_PORT = int(os.environ.get("WORKFORCE_PORT") or "8797")
 
 # pc-23: "lane" is retired vocabulary on rendered surfaces; roster data still
 # says kind=lane until the schema migration lands.
@@ -44,8 +45,8 @@ def _kind_label(kind: str) -> str:
     return _KIND_LABELS.get(kind, kind)
 
 LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
-DESK = os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799")
-CITYHALL = os.environ.get("WORKFORCE_CITYHALL", "http://127.0.0.1:8796")
+DESK = os.environ.get("WORKFORCE_DESK", os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799"))
+CITYHALL = os.environ.get("WORKFORCE_CITYHALL", os.environ.get("WORKFORCE_CITYHALL", "http://127.0.0.1:8796"))
 
 # ── Dashboard branding ──────
 # In a founded city the room name leads: "ProtocolCity — Roster · Workers".
@@ -230,6 +231,11 @@ body { background:var(--page); }
   font-variant-numeric:tabular-nums; max-width:220px; }
 .sys-meta .lamp { color:var(--dim); }
 .sys-meta .lamp.on { color:var(--ok); animation:blink 1.2s step-end infinite; }
+.you-attn { display:none; margin-left:10px; padding:3px 9px; border-radius:999px;
+  font:700 11px/1.1 ui-monospace,Menlo,monospace; text-decoration:none;
+  color:#5c3a08; background:linear-gradient(180deg,#ffe7a8,#f5c84a);
+  border:1px solid #a8681e; animation:blink 2.4s step-end infinite; }
+.you-attn.bump { animation:claimLand .9s ease-out; }
 .sys-meta .lamp.err { color:var(--fire); animation:blink 1.2s step-end infinite; }
 .sys-meta .ops { color:var(--dim); }
 .suite-doors { display:flex; align-items:center; gap:8px; flex:none; }
@@ -399,6 +405,9 @@ button.hire-submit:disabled { opacity:.55; cursor:default; }
 .bay-name a:hover { color:var(--verd); }
 .bay-sub { font-size:.62rem; color:var(--dim);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.bay-pay { font-size:.56rem; color:var(--dim); letter-spacing:.02em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  font-variant-numeric:tabular-nums; opacity:.88; }
 .status-chip { flex:none; font-size:.58rem; font-weight:700; letter-spacing:.08em;
   text-transform:uppercase; padding:3px 7px; border-radius:999px;
   border:1px solid var(--line); color:var(--dim); background:var(--card); }
@@ -419,6 +428,21 @@ a.bay-body .work-line, .bay-body a.work-line { color:var(--verd); }
 .bay-body .work-line .muted { color:var(--dim); }
 .bay-body .work-line.bad { color:var(--fire); }
 .bay-body .work-line.hot { color:var(--ok); font-weight:600; }
+.bay.claim-land {
+  box-shadow:0 0 0 2px #3d7a6a88, 0 4px 12px #2a241c22;
+  animation:claimLand .95s ease-out;
+}
+.bay.claim-land .work-line.hot {
+  animation:claimLandText .95s ease-out;
+}
+@keyframes claimLand {
+  0% { box-shadow:0 0 0 4px #3d7a6acc, 0 0 0 0 #3d7a6a00; transform:translateY(-2px); }
+  100% { box-shadow:0 0 0 0 #3d7a6a00; transform:none; }
+}
+@keyframes claimLandText {
+  0% { transform:scale(1.04); }
+  100% { transform:none; }
+}
 .meta-row { display:flex; justify-content:space-between; align-items:baseline;
   gap:8px; font-size:.68rem; color:var(--dim); font-variant-numeric:tabular-nums; }
 .meta-row .k { letter-spacing:.04em; text-transform:uppercase; font-size:.58rem; }
@@ -546,6 +570,16 @@ button.callin:disabled { color:var(--dim); border-color:var(--line); cursor:defa
 #pf .r .k { color:var(--dim); } #pf .r .v { color:var(--ink-deep); }
 #pf .r .v.bad { color:var(--fire); } #pf .r .v.good { color:var(--ok); }
 #pf .r .v.hot { color:var(--warn); text-shadow:none; }
+/* Runtimes strip — installed staffing pool at a glance */
+.runtimes-strip { display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+  padding:5px 14px; border-top:1px solid var(--line); }
+.runtimes-strip:empty { display:none; }
+.rt-label { font-size:.58rem; color:var(--dim); text-transform:uppercase;
+  letter-spacing:.07em; flex:none; margin-right:2px; }
+.rt-chip { font-size:.6rem; padding:1px 7px; border-radius:3px;
+  border:1px solid var(--line); color:var(--dim); cursor:default; }
+.rt-chip.available { border-color:var(--ok); color:var(--ok); }
+.rt-chip.absent { opacity:.35; }
 """
 
 # setInterval only — requestAnimationFrame suspends in background panes (the
@@ -584,6 +618,8 @@ SCENE_JS = """
 
 "use strict";
 var STATE=null, RAW_SCENE=null, TICK=0;
+/* Claim-land flash: first time we see a holding id for an in-flight worker. */
+var HOLDING_SEEN={}; var HOLDING_PRIMED=false;
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function $(id){return document.getElementById(id);}
@@ -607,10 +643,21 @@ function onShift(w){
 function inFlight(w){
   return !!(STATE && STATE.in_flight && w &&
     STATE.in_flight.indexOf(w.name)>=0);}
+function isPaused(w){
+  /* Daemon-owned iff schedule is five-field cron (schedule.maybe_cron).
+     "paused (...)" and other prose → not owned — surface as PAUSED, not IDLE. */
+  if(!w)return false;
+  if(w.owned===false||w.owned===0){
+    var sch=String(w.schedule||"").trim().toLowerCase();
+    if(!sch||sch==="manual")return false; /* citizen / manual seats */
+    return sch.split(/\s+/).length!==5;
+  }
+  return false;}
 function workerState(w){
   if(!w)return "waiting";
   if(w.health==="err"||w.health==="wedged")return "fault";
   if(onShift(w)||inFlight(w))return "on";
+  if(isPaused(w))return "paused";
   var nf=parseTs(w.next_fire);
   if(nf!=null){var s=Math.floor((nf-Date.now())/1000);
     if(s>0 && s<=120)return "imminent";}  /* ~2 min indoor commute */
@@ -620,6 +667,7 @@ function bayClass(w){
   if(st==="fault")cls+=" err";
   else if(st==="on")cls+=" on";
   else if(st==="imminent")cls+=" imminent";
+  else if(st==="paused")cls+=" waiting dim";
   else {cls+=" waiting"; if(w.health==="dim")cls+=" dim";}
   if(inFlight(w))cls+=" inflight";
   return cls;}
@@ -717,6 +765,7 @@ function statusLabel(w){
   if(st==="fault") return (w.health==="wedged")?"WEDGED":"FAULT";
   if(st==="on") return "ON SHIFT";
   if(st==="imminent") return "DUE SOON";
+  if(st==="paused") return "PAUSED";
   if(w.health==="dim") return "QUIET";
   return "IDLE";}
 function statusChipClass(w){
@@ -724,6 +773,7 @@ function statusChipClass(w){
   if(st==="fault") return "fault";
   if(st==="on") return "on";
   if(st==="imminent") return "imminent";
+  if(st==="paused") return "idle";
   return "idle";}
 function kindWord(w){
   var k=String(w.kind||"").toLowerCase();
@@ -751,18 +801,45 @@ function workerCabSlug(w){
   var wd=String((w&&w.workdir)||"").replace(/\\\\/g,"/");
   return (wd.split("/").filter(Boolean).pop()||"").toLowerCase();
 }
+function payrollLine(w){
+  /* Quiet subtitle: CLI · model pin (payroll metadata, not the persona). */
+  if(!w||String(w.kind||"")==="citizen"||w.no_clock_in)return "";
+  var cli=String(w.cli||"").trim();
+  var model=String(w.model||"").trim();
+  if(model==="default") model="";
+  if(cli&&model) return cli+" \\u00b7 "+model;
+  return cli||model||"";
+}
 function workingOn(w){
   /* Plain English: what they're doing / what's waiting / why stuck. */
   if(inFlight(w)||onShift(w)){
+    /* Prefer live Desk claim when scene carried a holding teaser (in_flight only). */
+    var held=w.holding||[];
+    if(held.length){
+      var t=held[0]||{};
+      var st=String(t.status||"");
+      var verb=st==="in_review"?"review":"doing";
+      var more=held.length>1?(" +"+String(held.length-1)+" more"):"";
+      var title=t.title?(" \\u00b7 "+String(t.title).slice(0,48)):"";
+      return {text:verb+" "+(t.id||"?")+title+more, cls:"hot",
+              claimHref:t.href||"", claimId:t.id||""};
+    }
     var ls=w.last_shift||{};
     var r=ls.reason?String(ls.reason):"";
     return {text: r?("on shift \\u00b7 "+r):"on shift now", cls:"hot"};
+  }
+  if(isPaused(w)){
+    var why=String(w.schedule||"").trim();
+    /* Prefer the parenthetical reason after "paused" when present. */
+    var m=why.match(/^paused\\s*(?:\\((.*)\\))?/i);
+    var detail=(m&&m[1])?m[1].trim():(why&&why.toLowerCase().indexOf("paused")===0?why:"schedule not armed");
+    return {text:"paused \\u00b7 "+detail, cls:"muted"};
   }
   if(w.health==="wedged"||w.health==="err"){
     return {text:w.why||((w.last_shift&&w.last_shift.reason)||"needs attention"), cls:"bad"};
   }
   var q=parseInt(w.queue,10);
-  if(!isNaN(q)&&q>0) return {text:q+" ready on the desk", cls:"", deskReady:q};
+  if(!isNaN(q)&&q>0) return {text:q+" ready", cls:"", deskReady:q};
   if(w.last_shift&&w.last_shift.outcome){
     var o=w.last_shift.outcome, reason=w.last_shift.reason?(" \\u00b7 "+w.last_shift.reason):"";
     return {text:"last "+o+reason, cls:"muted"};
@@ -782,10 +859,17 @@ function bay(w){
   var work=workingOn(w);
   var workCls="work-line"+(work.cls?(" "+work.cls):"");
   var cab=workerCabSlug(w);
-  var workHtml=work.deskReady
-    ?('<a class="'+workCls+'" href="'+esc(deskFilterHref(cab,"backlog"))+
-      '" title="Open Desk ready pile">'+esc(work.text)+'</a>')
-    :('<div class="'+workCls+'" title="'+esc(w.why||work.text)+'">'+esc(work.text)+'</div>');
+  var workHtml;
+  if(work.claimHref){
+    workHtml='<a class="'+workCls+'" href="'+esc(work.claimHref)+
+      '" target="_blank" rel="noopener" title="Open claim on Desk">'+esc(work.text)+'</a>';
+  }else if(work.deskReady){
+    workHtml='<a class="'+workCls+'" href="'+esc(deskFilterHref(cab,"backlog"))+
+      '" title="Open Desk ready pile">'+esc(work.text)+'</a>';
+  }else{
+    workHtml='<div class="'+workCls+'" title="'+esc(w.why||work.text)+'">'+esc(work.text)+'</div>';
+  }
+  var pay=payrollLine(w);
   var nextLabel=on?"Now":(st==="imminent"?"Due":"Next");
   var stuck=(w.health==="wedged"||w.health==="err")?"1":"0";
   var ready=work.deskReady?"1":"0";
@@ -803,7 +887,9 @@ function bay(w){
     '<div class="bay-top">'+
       '<div class="figure-slot">'+figure(w)+'</div>'+
       '<div class="bay-id"><div class="bay-name">'+link+'</div>'+
-        '<div class="bay-sub">'+esc(persona.role)+'</div></div>'+
+        '<div class="bay-sub">'+esc(persona.role)+'</div>'+
+        (pay?'<div class="bay-pay" title="payroll runtime">'+esc(pay)+'</div>':'')+
+        '</div>'+
       '<span class="status-chip '+statusChipClass(w)+'">'+esc(statusLabel(w))+'</span>'+
     '</div>'+
     '<div class="bay-body">'+body+'</div></article>';}
@@ -1003,8 +1089,51 @@ function renderAlarm(d){
   if(!faults.length){el.innerHTML='<span class="quiet">\\u25C6 ALL CHANNELS QUIET \\u00b7 SCHEDULE NOMINAL \\u00b7 '+esc(fmtL(new Date()))+'</span>'; return;}
   var line=faults.map(function(f){return '<span class="alert">FAULT '+esc(f)+'</span>';}).join("  \\u00b7  ");
   el.innerHTML='<div class="ticker">'+line+'  \\u00b7  '+line+'</div>';}
+
+function renderRuntimes(d){
+  var el=$("runtimesStrip"); if(!el)return;
+  var pool=(d&&d.runtimes)||[];
+  if(!pool.length){el.innerHTML="";return;}
+  var html='<span class="rt-label">Runtimes</span>';
+  pool.forEach(function(r){
+    var cls=r.path?(r.workers&&r.workers.length?"employed":"available"):"absent";
+    var tip=cls+(r.path?" \\u00b7 "+r.path:"")+(r.workers&&r.workers.length?" \\u00b7 "+r.workers.join(", "):"");
+    html+='<span class="rt-chip '+cls+'" title="'+esc(tip)+'">'+esc(r.cli)+'</span>';
+  });
+  el.innerHTML=html;}
+
+function flashClaimLands(d){
+  /* When a worker newly holds a Desk claim while in_flight, bay flashes once. */
+  if(!d) return;
+  var inflight={};
+  (d.in_flight||[]).forEach(function(n){ inflight[n]=1; });
+  var nowSeen={};
+  (d.sectors||[]).forEach(function(s){
+    (s.workers||[]).forEach(function(w){
+      if(!w||!w.name) return;
+      var ids=[];
+      (w.holding||[]).forEach(function(h){ if(h&&h.id) ids.push(String(h.id)); });
+      ids.sort();
+      var key=ids.join("|");
+      nowSeen[w.name]=key;
+      if(!HOLDING_PRIMED) return;
+      if(!inflight[w.name] || !ids.length) return;
+      var prev=HOLDING_SEEN[w.name]||"";
+      /* New claim id appeared (empty→id or id set grew/changed). */
+      if(key && key!==prev){
+        var bay=document.querySelector('.bay[data-worker="'+CSS.escape(w.name)+'"]');
+        if(bay){
+          bay.classList.add("claim-land");
+          setTimeout(function(){ bay.classList.remove("claim-land"); }, 950);
+        }
+      }
+    });
+  });
+  HOLDING_SEEN=nowSeen;
+  HOLDING_PRIMED=true;
+}
 function renderAll(d){
-  if(!d)return; STATE=d; renderBays(d); renderAlarm(d);
+  if(!d)return; STATE=d; flashClaimLands(d); renderBays(d); renderAlarm(d); renderRuntimes(RAW_SCENE);
   var dm=String(d.daemon||"—").toUpperCase();
   var flight=(d.in_flight&&d.in_flight.length)?" \\u00b7 "+d.in_flight.length+" IN FLIGHT":"";
   var ops=$("opsLine");
@@ -1270,7 +1399,69 @@ function paintScopeBanner(d){
     el.style.display="none";
   }
 }
+
+var YOU_ATTN_LAST=null;
+var YOU_NOTIFY_KEY="pc_you_notify";
+function youNotifyPref(){ try{return localStorage.getItem(YOU_NOTIFY_KEY)||"";}catch(e){return "";} }
+function setYouNotifyPref(v){ try{localStorage.setItem(YOU_NOTIFY_KEY,v);}catch(e){} }
+function maybeNotifyYouAttn(n, prev, d){
+  if(prev==null||n<=prev) return;
+  if(typeof Notification==="undefined"||Notification.permission!=="granted") return;
+  if(youNotifyPref()==="off") return;
+  var items=(d&&d.items)||[];
+  var top=items[0];
+  var body=top?((top.id||"")+" · "+String(top.title||top.note||"").slice(0,90)):(n+" waiting on You");
+  try{
+    var note=new Notification(n+" for You · Protocol City",{body:body,tag:"pc-you-attention",renotify:true});
+    note.onclick=function(){ try{window.focus();}catch(e){}
+      window.open("http://127.0.0.1:8799/admin/attention","_blank","noopener"); note.close(); };
+  }catch(e){}
+}
+function paintYouAttnRoster(d){
+  var el=document.getElementById("youAttn");
+  if(!el){
+    var host=document.querySelector(".sys-meta")||document.getElementById("opsLine")||document.getElementById("carrier");
+    if(!host||!host.parentNode) return;
+    el=document.createElement("a");
+    el.id="youAttn";
+    el.className="you-attn";
+    el.href="http://127.0.0.1:8799/admin/attention";
+    el.target="_blank";
+    el.rel="noopener";
+    host.parentNode.insertBefore(el, host.nextSibling);
+    el.addEventListener("dblclick", function(ev){
+      ev.preventDefault(); ev.stopPropagation();
+      if(typeof Notification==="undefined"){ alert("No Notification API here."); return; }
+      var req=Notification.permission==="default"?Notification.requestPermission():Promise.resolve(Notification.permission);
+      Promise.resolve(req).then(function(p){
+        if(p==="granted"){ setYouNotifyPref("on");
+          try{ new Notification("You · alerts on",{body:"Roster will notify when more items wait on You.",tag:"pc-you-attention-on"});}catch(e){}
+        } else setYouNotifyPref("off");
+      });
+    });
+  }
+  var n=(d&&d.ok!==false)?(d.count|0):(d|0);
+  if(typeof d==="number") n=d|0;
+  var prev=YOU_ATTN_LAST;
+  YOU_ATTN_LAST=n;
+  if(n<=0){ el.style.display="none"; el.textContent=""; return; }
+  el.style.display="inline-flex";
+  el.textContent=n+" for You";
+  el.title=n+" waiting on You · click Desk attention · dbl-click enable browser notify";
+  if(prev!=null && n>prev){
+    el.classList.add("bump");
+    setTimeout(function(){ el.classList.remove("bump"); }, 900);
+    if(typeof d==="object" && d) maybeNotifyYouAttn(n, prev, d);
+  }
+}
+function pollYouAttnRoster(){
+  fetch("http://127.0.0.1:8799/api/dev/attention",{cache:"no-store"})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){ if(d) paintYouAttnRoster(d); })
+    .catch(function(){});
+}
 function poll(){
+  pollYouAttnRoster();
   fetch("/api/scene",{cache:"no-store"}).then(function(r){
     if(!r.ok)throw 0; return r.json();
   }).then(function(d){
@@ -1307,10 +1498,15 @@ function tick(){
     if(chip){ chip.className="status-chip "+statusChipClass(w);
       chip.textContent=statusLabel(w); }
     var work=b.querySelector(".work-line");
-    if(work && work.tagName!=="A"){
-      var wo=workingOn(w); work.className="work-line"+(wo.cls?(" "+wo.cls):"");
-      work.textContent=wo.text; work.title=w.why||wo.text;
+    if(work){
+      var wo=workingOn(w);
+      work.className="work-line"+(wo.cls?(" "+wo.cls):"");
+      work.textContent=wo.text;
+      work.title=w.why||wo.text;
+      if(work.tagName==="A" && wo.claimHref) work.setAttribute("href", wo.claimHref);
     }
+    var payEl=b.querySelector(".bay-pay");
+    if(payEl){ var pl=payrollLine(w); if(pl) payEl.textContent=pl; }
   });
   TICK++;
   if(STATE && TICK%5===0)$("carrier").textContent="CARRIER \\u00b7 "+(STATE.generated_at?rel(STATE.generated_at):"LIVE");}
@@ -1464,8 +1660,17 @@ function renderPF(w){
     '<div class="sub">'+esc(w.kind||"unit")+' \\u00b7 '+esc(w.model||"default")+
     ' \\u00b7 identity '+esc(w.identity||"\\u2014")+(w.owned?' \\u00b7 OWNED':'')+'</div>'+pfCloseBtn();
   var cd=countdown(w.next_fire);
+  var payBits=[];
+  if(w.cli) payBits.push(String(w.cli));
+  if(w.model&&w.model!=="default") payBits.push(String(w.model));
   var h='<div class="r"><span class="k">CRON</span><span class="v" title="'+esc(w.schedule||"manual")+'">'+
       esc(cronSpeech(w.schedule||"manual"))+'</span></div>'+
+    '<div class="r"><span class="k">EMPLOYMENT</span><span class="v">'+
+      (w.owned?'ARMED \\u00b7 daemon-owned':(String(w.schedule||"").toLowerCase().indexOf("paused")===0
+        ?'PAUSED \\u00b7 not firing':'NOT OWNED \\u00b7 manual / unarmed'))+
+      '</span></div>'+
+    (payBits.length?'<div class="r"><span class="k">PAYROLL</span><span class="v">'+
+      esc(payBits.join(" \\u00b7 "))+'</span></div>':'')+
     '<div class="r"><span class="k">NEXT FIRE</span><span class="v">'+
       (w.next_fire?esc(cd.text):"\\u2014")+'</span></div>'+
     '<div class="r"><span class="k">QUEUE</span><span class="v">'+esc(w.queue!=null?w.queue:"\\u2014")+'</span></div>'+
@@ -1480,6 +1685,20 @@ function renderPF(w){
     '<div class="r"><span class="k">WORKDIR</span><span class="v">'+esc(w.workdir||"")+'</span></div>'+
     (w.succeeds?'<div class="r"><span class="k">SUCCESSION</span><span class="v">succeeds '+
       esc(w.succeeds)+'</span></div>':'');
+  /* FLAGS — governance layer: open labeled tickets not in active HOLDINGS. */
+  var wf=w.flags||[];
+  if(wf.length){
+    h+='<div class="pf-sec">FLAGS \\u2014 open tickets in lane ('+wf.length+')</div>';
+    wf.forEach(function(t){
+      var gated=t.founder_gated;
+      var cls=gated?"amber":"dim";
+      var lbl=gated?"founder\\u2011gated":String(t.status||"");
+      var href=t.href||(deskBaseUrl()+"/admin/desk?open="+encodeURIComponent(t.id||""));
+      h+='<div class="pf-shift"><a href="'+esc(href)+'" target="_blank" rel="noopener">'+
+        esc(t.id||"?")+'</a> \\u00b7 <span class="'+cls+'">'+esc(lbl)+'</span>'+
+        (t.title?' \\u00b7 '+esc(String(t.title).slice(0,72)):"")+'</div>';
+    });
+  }
   /* Holding + ready — what they have and what is next (emptying queues). */
   var held=w.holding||[];
   h+='<div class="pf-sec">HOLDING NOW \\u2014 Owner: claims on Desk</div>';
@@ -1717,29 +1936,20 @@ def _display_names(local_root: str) -> Dict[str, str]:
         return {}
 
 
-# Pre-installed Office staff (ops-critical scheduled jobs). Not cabinet hires.
-# Surface naming: Office staff bay — never mix with product patrols.
-_OFFICE_STAFF_IDENTITIES = frozenset({
-    "office-steward", "daily-brief", "wren",
-})
-# Back-compat alias used by older call sites
-_CIVIC_IDENTITIES = _OFFICE_STAFF_IDENTITIES
-
-
 def _sector_for_worker(
     wname: str, w: object, names: Dict[str, str]
 ) -> Tuple[str, str, str]:
     """Return (group_key, workplace_label, role) for floor grouping.
 
     role: you | staff | engine | business — drives the roof title.
-    Office staff (Holt/Ames/Wren) share one bay; Riley and product patrols
+    Workers with staff=True share one Office staff bay; product patrols
     stay with their cabinet (hired), not mixed into Office staff.
     """
     workdir = os.path.abspath(getattr(w, "workdir", "") or "")
     base = os.path.basename(workdir) if workdir else ""
     public = names.get(base, names.get(base.lower(), base or "unknown"))
 
-    if wname in _OFFICE_STAFF_IDENTITIES:
+    if getattr(w, "staff", False):
         return ("__office_staff__", "Office staff", "staff")
 
     if base.lower() in ("workforce", "workforce") or public == "WorkForce":
@@ -1798,7 +2008,7 @@ def render_board(local_root: str, can_dispatch: bool = False) -> str:
            "<strong>Legacy tables.</strong> Day-to-day management lives on the "
            "<a href='/' style='color:#ffcc33'>Roster</a> "
            "(overview + bays). This page keeps the dense tables for power use. "
-           "· <a href='/#overview' style='color:#ffcc33'>floor overview</a> · "
+           "· <a href='/#overview' style='color:#ffcc33'>overview</a> · "
            "<a href='/report' style='color:#ffcc33'>full overview sheet</a>"
            "</div>",
            "<header><h1>%s <small>— classic board (legacy) · powered by WorkForce · "
@@ -1921,7 +2131,7 @@ def render_board(local_root: str, can_dispatch: bool = False) -> str:
             q_html = ("<span class='amber'>%s</span>" % q) if q not in ("0", "—", "?") else q
             qlink = _queue_human_link(w)
             if qlink and q not in ("—",):
-                q_html = "<a href='%s' title='open these tickets on the desk'>%s</a>" % (
+                q_html = "<a href='%s' title='open these tickets in WorkLane'>%s</a>" % (
                     html.escape(qlink), q_html)
             if cron and status == "running":
                 nf = "<span class='ok'>%s</span>" % html.escape(_fmt_fire(nf_dt))
@@ -1982,7 +2192,7 @@ def render_board(local_root: str, can_dispatch: bool = False) -> str:
     else:
         out.append("<p class='dim'>launchctl unavailable or no service entries.</p>")
 
-    out.append("<h2>WorkLane — signed work (the other half of the join)</h2>")
+    out.append("<h2>WorkLane — throughput data</h2>")
     if summary:
         out.append("<p><span class='amber'>%s</span> ready · %s in flight · "
                    "<span class='%s'>%s stalled</span></p>"
@@ -2001,16 +2211,23 @@ def render_board(local_root: str, can_dispatch: bool = False) -> str:
                           html.escape(first[:140])))
         out.append("</table>")
     elif summary == {}:
-        out.append("<p class='err'>Desk unreachable at %s.</p>" % html.escape(DESK))
+        out.append("<p class='err'>WorkLane unreachable at %s.</p>" % html.escape(DESK))
 
     out.append("<footer><a href='/'>▶ back to the Roster</a> · "
-               "<a href='/#overview'>overview (in room)</a> · "
+               "<a href='/#overview'>overview</a> · "
                "<a href='/report'>full overview sheet</a> — "
-               "the living room is the front door; "
-               "this classic board is the legacy deep tables. "
-               "Workers feed WorkLane · the runner feeds the ledger · the truth is the "
-               "join. Rules render from disk — a lens, never a copy.</footer>")
+               "this classic board keeps the dense tables. "
+               "Workers feed WorkLane · the runner feeds the ledger. "
+               "Rules render from disk — a lens, never a copy.</footer>")
     return "".join(out)
+
+
+def _cli_label(worker: Worker) -> str:
+    """Basename of command[0] for bay payroll subtitle (claude/grok/codex/…)."""
+    cmd = worker.command or []
+    if not cmd:
+        return ""
+    return os.path.basename(str(cmd[0]))
 
 
 def scene_model(local_root: str) -> Dict[str, object]:
@@ -2020,13 +2237,18 @@ def scene_model(local_root: str) -> Dict[str, object]:
 
     Pure: raw facts only, no per-second derivation. The scene JS computes
     on-shift / T-minus / progress client-side each tick, so viewer-truth
-    tracks the wall clock without a re-fetch. Network-free in the hot path —
-    the desk-activity traffic tape is a separate proxy (deferred follow-up).
+    tracks the wall clock without a re-fetch. Hot path stays network-free
+    except a bounded desk probe for workers currently in_flight (live claim
+    teaser on the bay) — idle floors still hit zero desk URLs.
     """
     roster = _load_roster(local_root)
     status = heartbeat_status(local_root)
     hb = read_heartbeat(local_root) or {}
     names = _display_names(local_root)
+    in_flight_raw = hb.get("in_flight") or []
+    if not isinstance(in_flight_raw, list):
+        in_flight_raw = []
+    in_flight_set = {str(x) for x in in_flight_raw}
 
     sectors: Dict[str, Dict[str, object]] = {}
     if roster:
@@ -2049,15 +2271,25 @@ def scene_model(local_root: str) -> Dict[str, object]:
             # Prefer ProtocolCity workdir for Office staff papers when present
             if role == "staff" and "ProtocolCity" in workdir:
                 sec["workdir"] = workdir
+            # Live claim teaser only while the daemon has them in flight —
+            # keeps the idle scene network-free (desk can be slow/down).
+            holding: List[Dict[str, object]] = []
+            if name in in_flight_set:
+                try:
+                    holding = _worker_holdings(w)[:3]
+                except Exception:
+                    holding = []
             sec["workers"].append({  # type: ignore[union-attr]
                 "name": name, "kind": _kind_label(w.kind),
                 "display": w.display or "",
+                "cli": _cli_label(w),
                 "model": w.model or "default", "schedule": w.schedule or "",
                 "owned": bool(cron),
                 "owner": w.owner or "",
                 "skill": w.skill or "",
                 "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
                 "queue": q, "health": health["cls"], "why": health["why"],
+                "holding": holding,
                 "last_shift": ({"ts": last["ts"], "outcome": last["outcome"],
                                 "passes": last["passes"], "reason": last["reason"]}
                                if last else None),
@@ -2072,6 +2304,7 @@ def scene_model(local_root: str) -> Dict[str, object]:
             "name": "you",
             "kind": "citizen",
             "display": "You · this Office",
+            "cli": "",
             "model": "",
             "schedule": "",
             "owned": False,
@@ -2079,6 +2312,7 @@ def scene_model(local_root: str) -> Dict[str, object]:
             "queue": "—",
             "health": "ok",
             "why": "citizen",
+            "holding": [],
             "last_shift": None,
             "no_clock_in": True,
             "href": CITYHALL,
@@ -2108,13 +2342,16 @@ def scene_model(local_root: str) -> Dict[str, object]:
     except Exception:
         services = []
     sector_list = [you_sec] + sorted(sectors.values(), key=_sector_sort)
+    _detected = runtimes_mod.detect()
+    _pool = runtimes_mod.staffing_pool(_detected, roster)
     return {
         "generated_at": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "daemon": daemon,
-        "in_flight": hb.get("in_flight", []),
+        "in_flight": list(in_flight_raw),
         "last_tick": hb.get("last_tick", ""),
         "sectors": sector_list,
         "services": services,
+        "runtimes": _pool,
     }
 
 
@@ -2409,7 +2646,8 @@ def render_scene(local_root: str, can_dispatch: bool = False) -> str:
         "<div class='floor'>"
         "<div class='cabinet-rail' id='cabinetRail' aria-label='Filter by cabinet'></div>"
         "<div class='hired-floor' id='grid'>"
-        "<div class='empty'>AWAITING WORKFORCE TELEMETRY…</div></div></div>"
+        "<div class='empty'>AWAITING WORKFORCE TELEMETRY…</div></div>"
+        "<div id='runtimesStrip' class='runtimes-strip'></div></div>"
         # Footer: room verbs left, bay census right. No poll / desk traffic.
         "<footer class='bar'>"
         "<div class='foot-verbs'>"
@@ -2653,8 +2891,8 @@ function render(){
   var dk=d.desk||{};
   if(!dk.ok){
     $("thruRows").innerHTML="";
-    $("thruNote").innerHTML='desk feed offline \\u2014 the desk owns these numbers; '+
-      'the panel holds until the carrier returns';
+    $("thruNote").innerHTML='WorkLane feed offline \\u2014 throughput numbers unavailable; '+
+      'the panel holds until it returns';
   } else {
     var maxT=1; (dk.authors||[]).forEach(function(a){maxT=Math.max(maxT,a.filed,a.closed);});
     var rostered=(dk.authors||[]).filter(function(a){return a.worker;});
@@ -2670,7 +2908,7 @@ function render(){
         '<span class="meter g" style="width:'+pct(a.closed,maxT)+'%"></span></span>'+
         '<span class="num">'+esc(a.filed)+' / '+esc(a.closed)+'</span>';});
     $("thruRows").innerHTML=tz||'<span class="note">no signed activity in window</span>';
-    $("thruNote").innerHTML='amber = filed \\u00b7 green = closed \\u00b7 signed on the desk, '+
+    $("thruNote").innerHTML='amber = filed \\u00b7 green = closed \\u00b7 signed on WorkLane, '+
       'joined to the roster by identity \\u00b7 unmatched signers dim';
   }
 
@@ -2844,7 +3082,7 @@ def render_report(local_root: str, days: Optional[int] = None) -> str:
         "<div class='note'>busy time from the ledger · tokens/cost where the "
         "vendor CLI reports them · vendor limits stay on vendor "
         "settings pages — this is the city's relative burn</div></div>"
-        "<h2>Floor state · where the bays stand</h2>"
+        "<h2>Worker state · where the workers stand</h2>"
         "<div class='card'><div class='split' id='splitBar'></div>"
         "<div class='legend' id='splitLegend'></div></div>"
         "<h2>The schedule's word · daemon + next fires</h2>"
@@ -2854,7 +3092,7 @@ def render_report(local_root: str, days: Optional[int] = None) -> str:
         "<h2>Throughput · filed vs closed per identity, last %dd</h2>"
         "<div class='winsel'>%s</div>"
         "<div class='card'><div class='rows' id='thruRows'></div>"
-        "<div class='note' id='thruNote'>raising the desk…</div></div>"
+        "<div class='note' id='thruNote'>connecting…</div></div>"
         "<h2>Quiet list · employed but not firing</h2>"
         "<div class='card'><span class='stamp' id='quietStamp'>—</span>"
         "<div class='note' id='quietNote'></div></div>"
@@ -2985,6 +3223,54 @@ def _worker_ready_teaser(w: Worker, *, limit: int = 10) -> List[Dict[str, object
     return out
 
 
+def _worker_flags(w: Worker) -> List[Dict[str, object]]:
+    """Open tickets in this worker's lane not yet in active hands (backlog + parked).
+
+    Governance layer: surfaces blocked or waiting work so the health badge
+    isn't the only signal on the personnel card.  Empty list when queue_url
+    is absent or DESK unreachable — always safe to skip rendering.
+    """
+    product = ""
+    label = ""
+    if w.queue_url:
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(w.queue_url).query)
+            product = (qs.get("product") or qs.get("project") or [""])[0]
+            label = (qs.get("label") or [""])[0]
+        except Exception:
+            product = ""
+    if not product or product == "all":
+        product = os.path.basename(os.path.abspath(w.workdir or "")).lower()
+    if not product or not label:
+        return []
+    flags: List[Dict[str, object]] = []
+    seen: set = set()
+    for status in ("backlog", "parked"):
+        d = _desk_json(
+            "/api/admin/tasks?product=%s&label=%s&status=%s&limit=30"
+            % (urllib.parse.quote(product), urllib.parse.quote(label), status))
+        for t in (d or {}).get("tasks") or []:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("id") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            task_labels = [str(lbl) for lbl in (t.get("labels") or [])]
+            founder_gated = any("needs:founder" in lbl for lbl in task_labels)
+            flags.append({
+                "id": tid,
+                "title": str(t.get("title") or ""),
+                "status": status,
+                "priority": t.get("priority"),
+                "labels": task_labels,
+                "founder_gated": founder_gated,
+                "href": "%s/admin/desk?open=%s" % (
+                    DESK.rstrip("/"), urllib.parse.quote(tid)),
+            })
+    return flags
+
+
 def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
     """One worker's personnel file as a read model — the facts the
     in-scene drawer renders: identity plate, schedule/queue/health, the
@@ -3009,13 +3295,15 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         })
     shifts = parse_shifts(
         Ledger(os.path.join(local_root, "ledger"), name).tail(400), limit=10)
-    # Holding = Owner: claims; ready = top of their product queue (emptying).
+    # Holding = Owner: claims; ready = top of queue; flags = governance layer.
     holding = _worker_holdings(w)
     ready = _worker_ready_teaser(w) if w.queue_url else []
+    flags = _worker_flags(w) if w.queue_url else []
     return {
         "name": name, "kind": _kind_label(w.kind),
         "display": w.display or "",
         "succeeds": w.succeeds or "",
+        "cli": _cli_label(w),
         "model": w.model or "default", "identity": w.identity,
         "workdir": os.path.abspath(w.workdir),
         "schedule": w.schedule or "", "owned": bool(cron),
@@ -3026,6 +3314,7 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         "holding": holding,
         "holding_count": len(holding),
         "ready": ready,
+        "flags": flags,
         "law": law,
         "shifts": [{"ts": s["ts"], "outcome": s["outcome"],
                     "passes": s["passes"], "queue": s["queue"],
@@ -3108,6 +3397,8 @@ def _worker_health(local_root: str, w: Worker, queue: str) -> Dict[str, str]:
     if not real:
         return {"cls": "dim", "why": "no shifts yet"}
     last = real[0]
+    if last["outcome"] == "vendor_limit":
+        return {"cls": "amber", "why": last["reason"] or "vendor limit"}
     if last["outcome"] in ("error", "crashed"):
         return {"cls": "err", "why": "last desk run %s: %s"
                                      % (last["outcome"].upper(), last["reason"] or "?")}
@@ -3163,7 +3454,7 @@ def render_shifts(local_root: str, worker_name: str) -> Optional[str]:
 
 
 OUTCOME_CLS = {"ok": "ok", "error": "err", "skip": "dim", "warn": "amber",
-               "running": "amber", "crashed": "err"}
+               "running": "amber", "crashed": "err", "vendor_limit": "amber"}
 
 
 def render_worker(local_root: str, name: str) -> Optional[str]:
@@ -3195,6 +3486,21 @@ def render_worker(local_root: str, name: str) -> Optional[str]:
                % (_kind_label(w.kind), html.escape(w.model or "default"), w.budget_secs,
                   w.max_passes, html.escape(w.schedule or "manual"),
                   html.escape(next_fire), q))
+
+    flags = _worker_flags(w)
+    if flags:
+        out.append("<h2>Flags — open tickets in lane (%d)</h2>" % len(flags))
+        out.append("<table><tr><th>ticket</th><th>status</th><th>title</th></tr>")
+        for f in flags:
+            cls = "amber" if f.get("founder_gated") else "dim"
+            lbl = "founder-gated" if f.get("founder_gated") else str(f.get("status") or "")
+            href = html.escape(str(f.get("href") or ""))
+            tid = html.escape(str(f.get("id") or ""))
+            title = html.escape(str(f.get("title") or ""))
+            link = "<a href='%s'>%s</a>" % (href, tid) if href else tid
+            out.append("<tr><td>%s</td><td class='%s'>%s</td><td>%s</td></tr>"
+                       % (link, cls, html.escape(lbl), title))
+        out.append("</table>")
 
     out.append("<h2>Instructions — the stack the next shift reads (rendered from disk)</h2>")
     out.append("<table><tr><th>level</th><th>instruction</th><th>file</th><th>sha256</th>"
@@ -3300,16 +3606,28 @@ def render_law(local_root: str, worker_name: str, which: str) -> Optional[str]:
     if not roster or worker_name not in roster.workers:
         return None
     w: Worker = roster.workers[worker_name]
+    stack = _law_stack(w)
+    path = None
+    level = ""
+    label = ""
     if which.startswith("stack"):
-        # any level of the resolved stack — path comes from the stack walk,
-        # never from the URL
-        stack = _law_stack(w)
+        # path comes from the stack walk, never from the URL
         try:
-            path = stack[int(which[len("stack"):])]["path"]
+            entry = stack[int(which[len("stack"):])]
+            path = entry["path"]
+            level = entry["level"]
+            label = entry["label"]
         except (ValueError, IndexError):
             return None
+    elif which in ("contract", "prompt"):
+        path = w.contract if which == "contract" else w.prompt
+        for entry in stack:
+            if entry["label"] == which:
+                level = entry["level"]
+                label = entry["label"]
+                break
     else:
-        path = w.contract if which == "contract" else w.prompt if which == "prompt" else None
+        return None
     if not path:
         return None
     try:
@@ -3317,12 +3635,28 @@ def render_law(local_root: str, worker_name: str, which: str) -> Optional[str]:
             text = fh.read()
     except OSError:
         return None
-    return ("<!doctype html><meta charset='utf-8'><title>%s — %s</title><style>%s</style>"
-            "<header><h1>LAW LENS <small>— %s / %s · %s</small></h1></header>"
-            "<p class='dim'>Rendered from disk at request time — this is byte-for-byte "
-            "what the next shift reads.</p><pre>%s</pre><p><a href='/'>&larr; Roster</a></p>"
-            % (html.escape(worker_name), which, CSS, html.escape(worker_name), which,
-               html.escape(path), html.escape(text)))
+    badge = ("%s · %s" % (level, label)) if level else which
+    fname = os.path.basename(path)
+    return (
+        "<!doctype html><meta charset='utf-8'>"
+        "<title>%s — %s · %s</title>"
+        "<style>%s</style>"
+        "<header><h1><span class='amber'>%s</span>"
+        " <small>— %s · %s</small></h1></header>"
+        "<p class='dim'>Rendered from disk at request time — this is byte-for-byte "
+        "what the next shift reads.</p>"
+        "<pre>%s</pre>"
+        "<p><a href='/worker/%s'>← %s</a>"
+        " · <a href='/'>Roster</a></p>"
+        % (
+            html.escape(worker_name), html.escape(badge), html.escape(fname),
+            CSS,
+            html.escape(badge),
+            html.escape(worker_name), html.escape(fname),
+            html.escape(text),
+            html.escape(worker_name), html.escape(worker_name),
+        )
+    )
 
 
 def _days_param(path: str) -> Optional[int]:
@@ -3515,7 +3849,8 @@ class _Handler(BaseHTTPRequestHandler):
                     workers.append({
                         "name": name, "kind": w.kind, "workdir": os.path.abspath(w.workdir),
                         "display": w.display or "", "succeeds": w.succeeds or "",
-                        "identity": w.identity, "model": w.model,
+                        "identity": w.identity,
+                        "cli": _cli_label(w), "model": w.model,
                         "schedule": w.schedule, "owned": bool(cron),
                         "owner": w.owner or "",
                         "skill": w.skill or "",

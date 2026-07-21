@@ -39,6 +39,22 @@ SCRUBBED_ENV = ("TP_AGENT_ID", "TP_PRODUCT", "TP_DEFAULT_PRODUCT")
 IDENTITY_ENV = "TP_AGENT_ID"
 PREDIRTY_ENV = "WORKFORCE_PREDIRTY"
 LOCK_GRACE_SECS = 600
+_GHOST_AUDIT_TIMEOUT = 60
+
+# Vendor-limit exit signatures. Case-insensitive substring match against
+# the last 8 KB of the run output. Extend here as new vendors surface new phrases;
+# policy (auto-bench, alerting) stays OUT of this table — roster config, not engine code.
+_VENDOR_LIMIT_PATTERNS = (
+    "402",
+    "429",
+    "quota",
+    "rate limit",
+    "rate-limit",
+    "usage balance",
+    "spending limit",
+    "payment required",
+    "credits or reached",  # grok team-spend class: "used all available credits or reached…"
+)
 
 
 class InfraError(RuntimeError):
@@ -89,6 +105,21 @@ def _sha256(path: str) -> Tuple[str, str]:
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     return text, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_chain(paths: List[str]) -> List[Tuple[str, str]]:
+    """Load §6 authority-chain files; return [(text, sha16), ...].
+
+    Raises InfraError on any unreadable file — a partial chain must fail
+    closed, never silently narrow the authority surface.
+    """
+    result = []
+    for path in paths:
+        try:
+            result.append(_sha256(path))
+        except OSError as exc:
+            raise InfraError("authority chain file unreadable: %s" % exc)
+    return result
 
 
 def _free_mb(path: str) -> int:
@@ -170,7 +201,8 @@ def _predirty_snapshot(worker: Worker, run_dir: str) -> Optional[str]:
     return path
 
 
-def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str]) -> Dict[str, str]:
+def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str],
+               chain_paths: Optional[List[str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     for var in SCRUBBED_ENV:
         env.pop(var, None)
@@ -184,6 +216,8 @@ def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str]) -
     env[IDENTITY_ENV] = worker.identity
     if predirty:
         env[worker.predirty_env or PREDIRTY_ENV] = predirty
+    if chain_paths:
+        env["WORKFORCE_AUTHORITY_CHAIN_PATHS"] = ":".join(chain_paths)
     env.update(worker.env)
     if secret and worker.keychain_env:
         env[worker.keychain_env] = secret
@@ -231,7 +265,7 @@ def _usage_from_output(out_path: str, offset: int, fields: Dict[str, str]) -> Di
         return {}
 
 
-def _build_argv(worker: Worker, prompt_text: str) -> List[str]:
+def _build_argv(worker: Worker, prompt_text: str, chain_text: str = "") -> List[str]:
     argv: List[str] = []
     for token in worker.command:
         if "{model}" in token:
@@ -244,10 +278,64 @@ def _build_argv(worker: Worker, prompt_text: str) -> List[str]:
                     argv.pop()
                 continue
             token = token.replace("{model}", worker.model)
+        token = token.replace("{chain_text}", chain_text)
         token = token.replace("{prompt_text}", prompt_text)
         token = token.replace("{prompt_path}", worker.prompt)  # CLIs that take a file
         argv.append(token)
     return argv
+
+
+def _classify_exit(out_path: str) -> str:
+    """Return 'vendor limit: <trigger line>' or 'agent exit' for a non-zero rc.
+
+    Scans the last 8 KB of the run output for known vendor-limit signals.
+    Must never raise — a classification failure must not mask the real error.
+    """
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 8192))
+            tail = fh.read()
+        lower = tail.lower()
+        for pattern in _VENDOR_LIMIT_PATTERNS:
+            idx = lower.find(pattern)
+            if idx == -1:
+                continue
+            start = lower.rfind("\n", 0, idx) + 1
+            end = lower.find("\n", idx)
+            line = tail[start:(end if end != -1 else None)].strip()
+            return "vendor limit: " + line[:120]
+    except Exception:
+        pass
+    return "agent exit"
+
+
+def _run_ghost_audit(worker: Worker, env: Dict[str, str], ledger: Ledger) -> None:
+    """Run the roster ghost_audit command (§8 SHOULD). Non-fatal.
+
+    Writes a GHOST ledger event with rc + first-line summary. Nonzero rc or
+    exec failure appends a WARN; never aborts the shift.
+    """
+    try:
+        proc = subprocess.run(
+            worker.ghost_audit,
+            cwd=worker.workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_GHOST_AUDIT_TIMEOUT,
+        )
+        combined = (proc.stdout + proc.stderr).strip()
+        summary = combined.splitlines()[0][:120] if combined else ""
+        ledger.append("GHOST", rc=proc.returncode, summary=summary)
+        if proc.returncode != 0:
+            ledger.append("WARN", reason="ghost-audit rc=%d" % proc.returncode)
+    except subprocess.TimeoutExpired:
+        ledger.append("GHOST", rc=-1, summary="timeout after %ds" % _GHOST_AUDIT_TIMEOUT)
+        ledger.append("WARN", reason="ghost-audit timed out")
+    except Exception as exc:
+        ledger.append("GHOST", rc=-1, summary="exec error: %.80s" % exc)
+        ledger.append("WARN", reason="ghost-audit exec error")
 
 
 def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
@@ -272,11 +360,32 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             ledger.append("ERROR", reason="law unreadable: %s" % exc)
             return 1
 
+        # §6 authority-chain enforcement
+        if worker.authority_chain_required and not worker.authority_chain:
+            ledger.append("ERROR", reason="NO_AUTHORITY_CHAIN")
+            return 1
+        chain_entries: List[Tuple[str, str]] = []
+        if worker.authority_chain:
+            try:
+                chain_entries = _load_chain(worker.authority_chain)
+            except InfraError as exc:
+                ledger.append("ERROR", reason=str(exc))
+                return 1
+        chain_text = "\n\n".join(t for t, _ in chain_entries)
+        chain_shas = [sha for _, sha in chain_entries]
+
         predirty = None if dry_run else _predirty_snapshot(worker, os.path.join(local_root, "run"))
         secret = None if dry_run else _fetch_secret(worker)
-        env = _build_env(worker, predirty, secret)
-        argv = _build_argv(worker, prompt_text)
+        env = _build_env(worker, predirty, secret,
+                         chain_paths=worker.authority_chain if chain_entries else None)
+        argv = _build_argv(worker, prompt_text, chain_text=chain_text)
 
+        if not dry_run and worker.ghost_audit:
+            _run_ghost_audit(worker, env, ledger)
+
+        chain_kwargs: Dict[str, object] = {"chain_len": len(chain_entries)}
+        if chain_shas:
+            chain_kwargs["chain_sha"] = ",".join(chain_shas)
         ledger.append(
             "START",
             identity=worker.identity, kind=worker.kind,
@@ -285,6 +394,7 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             queue=("?" if queue_count is None else queue_count),
             contract_sha=contract_sha, prompt_sha=prompt_sha,
             dry_run=int(dry_run),
+            **chain_kwargs,
         )
 
         if dry_run:
@@ -320,7 +430,8 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
                               budget_secs=worker.budget_secs, on_pass=passes + 1)
                 return 1
             if rc != 0:
-                ledger.append("ERROR", reason="agent exit", rc=rc, on_pass=passes + 1)
+                ledger.append("ERROR", reason=_classify_exit(out_path),
+                              rc=rc, on_pass=passes + 1)
                 return 1
             passes += 1
             outfh.flush()
