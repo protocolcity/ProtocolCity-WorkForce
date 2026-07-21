@@ -1,5 +1,10 @@
 # WorkForce
 
+> **Pre-release (0.1.x).** Part of the **ProtocolCity** suite with
+> [WorkLane](https://github.com/protocolcity/ProtocolCity-WorkLane) and
+> [BluePrint](https://github.com/protocolcity/ProtocolCity-BluePrint).
+> Expect sharp edges; file issues.
+
 **Employment infrastructure for agents.**
 
 WorkForce turns AI agents into a staffed workforce. Each worker has identity
@@ -7,15 +12,18 @@ papers (a contract and a prompt), a schedule, a budget, and a tamper-evident
 shift ledger. One daemon dispatches every shift; one board — the **Roster** —
 shows you who is employed, who is on the floor, and what every shift cost.
 
-Part of the [ProtocolCity](https://github.com/protocolcity) suite: pairs
-naturally with **WorkLane** (the ticket desk your workers pull work from),
-and runs standalone against any queue that can answer a ready-count URL.
-Everything is local-first — the roster is a JSON file on your machine, the
-ledger is an append-only record, and there is no cloud dependency.
+## Install the whole suite (recommended)
 
-## Quickstart
-
+```bash
+brew install protocolcity/tap/protocolcity
+protocolcity found ~/my-city
+protocolcity serve --with-engines
+# → http://127.0.0.1:8801/  (Map · Desk · Roster)
 ```
+
+## WorkForce alone
+
+```bash
 pip install protocolcity-workforce
 
 workforce roster                     # who is employed
@@ -23,6 +31,24 @@ workforce dispatch <worker> --dry-run   # rehearse one shift, spend nothing
 workforce ledger <worker>            # the shift record
 workforce daemon                     # the scheduler — one service, serves the board
 workforce open                       # open the Roster board in your browser
+```
+
+Part of the [ProtocolCity](https://github.com/protocolcity) suite: pairs
+naturally with **WorkLane** (the ticket desk your workers pull work from),
+and runs standalone against any queue that can answer a ready-count URL.
+Everything is local-first — the roster is a JSON file on your machine, the
+ledger is an append-only record, and there is no cloud dependency.
+
+## Quickstart (same as alone)
+
+```
+pip install protocolcity-workforce
+
+workforce roster
+workforce dispatch <worker> --dry-run
+workforce ledger <worker>
+workforce daemon
+workforce open
 ```
 
 The board serves at `http://127.0.0.1:8797` by default.
